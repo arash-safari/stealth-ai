@@ -1,0 +1,33 @@
+version: "3"
+output: interleaved
+dotenv: [".env.local"]
+
+tasks:
+  install:
+    desc: Install deps
+    cmds:
+      - uv sync
+
+  intent-console:
+    desc: Live mic/speaker console test
+    interactive: true
+    env:
+      PYTHONUNBUFFERED: "1"
+      LIVEKIT_LOG_LEVEL: "debug"
+    cmds:
+      - uv run -m agents.agent console
+
+  intent-dev:
+    desc: Worker (no local audio required)
+    interactive: true
+    env:
+      PYTHONUNBUFFERED: "1"
+      LIVEKIT_LOG_LEVEL: "debug"
+    cmds:
+      - uv run -m agents.agent dev
+
+  sip-lifecycle-dev:
+    desc: Run the SIP lifecycle agent
+    interactive: true
+    cmds:
+      - uv run src/agents/sip_lifecycle_agent.py dev

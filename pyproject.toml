@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "plumber-ai-agent"
+version = "1.0.0"
+description = "Simple voice AI assistant built with LiveKit Agents for Python"
+requires-python = ">=3.9"
+
+dependencies = [
+  # Core agent SDK + extras for VAD & turn detection used in the sample code
+  "livekit-agents[turn-detector,silero]~=1.2",
+
+  # Audio/telephony plugins (keep only the ones you use)
+  "livekit-plugins-openai",
+  "livekit-plugins-deepgram",
+  "livekit-plugins-silero",
+  "livekit-plugins-cartesia",
+  "livekit-plugins-elevenlabs",
+  "livekit-plugins-noise-cancellation~=0.2",
+
+  # LLM + config
+  "openai>=1.40",
+  "pydantic>=2",
+  "python-dotenv>=1.0",
+
+  # API + server
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.30",
+
+  # Database
+  "SQLAlchemy[asyncio]>=2.0",
+  "asyncpg>=0.29",
+  "pydantic[email]>=2",
+]
+
+[dependency-groups]
+dev = [
+  "pytest",
+  "pytest-asyncio",
+  "ruff",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "B", "A", "C4", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
