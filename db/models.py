@@ -1,4 +1,3 @@
-# db/models.py
 from __future__ import annotations
 
 import os
@@ -14,11 +13,13 @@ from sqlalchemy import (
     UniqueConstraint,
     Boolean,
     Index,
+    BigInteger
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy import DateTime as SADateTime
+from sqlalchemy.schema import Identity
 
 # ---------- DB Setup ----------
 import os
@@ -126,7 +127,21 @@ class TechShift(Base):
 
 class Appointment(Base):
     __tablename__ = "appointments"
+    __table_args__ = (
+        UniqueConstraint("appointment_no", name="uq_appointments_appointment_no"),
+    )
+
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    # Public, user-facing number (0,1,2,...)
+    appointment_no: Mapped[int] = mapped_column(
+        BigInteger,
+        Identity(start=0, minvalue=0),
+        nullable=False,
+        index=True,
+        unique=True,
+    )
+
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
     tech_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("techs.id", ondelete="CASCADE"))
     start_ts: Mapped[datetime] = mapped_column(SADateTime(timezone=True))

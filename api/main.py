@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select, update, delete, insert
 from sqlalchemy.exc import IntegrityError
 from contextlib import asynccontextmanager
-import os 
+import os
 from dotenv import load_dotenv
 from typing import Literal  # already present
 
@@ -116,6 +116,7 @@ class AppointmentPatch(BaseModel):
 
 class AppointmentOut(BaseModel):
     id: str
+    appointment_no: int                           # ← include user-facing number
     user_id: str
     tech_id: str
     start: datetime
@@ -166,7 +167,7 @@ class UserOut(BaseModel):
     full_name: str
     phone: str
     email: Optional[str] = None
-    addresses: List[AddressOut] = Field(default_factory=list) 
+    addresses: List[AddressOut] = Field(default_factory=list)
 
 # ---------------------------
 # Helpers
@@ -334,7 +335,6 @@ async def availability(
         address_postal_code=postal_code,
         respect_google_busy=respect_google_busy,
     )
-    # schedule_service already returns datetimes; FastAPI will serialize
     return [SlotOut(**s) for s in slots]
 
 
@@ -345,9 +345,10 @@ async def availability(
 async def create_appt(body: AppointmentCreate):
     """
     Create an appointment with explicit tech+time or by skill (earliest).
+    Always returns appointment_no.
     """
     if body.tech_id and body.start and body.end:
-        appt = await create_meeting(
+        created = await create_meeting(
             user_id=body.user_id,
             tech_id=body.tech_id,
             start=body.start,
@@ -355,17 +356,19 @@ async def create_appt(body: AppointmentCreate):
             priority=body.priority,
             request_text=body.request_text,
         )
-        return AppointmentOut(**appt)
+        full = await read_meeting(created["id"])   # ← ensure appointment_no is included
+        return AppointmentOut(**full)
 
     if body.skill and not (body.start or body.end or body.tech_id):
-        appt = await create_earliest_meeting(
+        created = await create_earliest_meeting(
             user_id=body.user_id,
             skill=body.skill,
             duration_min=120,
             priority=body.priority,
             request_text=body.request_text,
         )
-        return AppointmentOut(**appt)
+        full = await read_meeting(created["id"])   # ← ensure appointment_no is included
+        return AppointmentOut(**full)
 
     raise HTTPException(
         400,
@@ -375,21 +378,20 @@ async def create_appt(body: AppointmentCreate):
 
 @app.get("/appointments/{appointment_id}", response_model=AppointmentOut)
 async def get_appt(appointment_id: str):
-    appt = await read_meeting(appointment_id)
+    appt = await read_meeting(appointment_id)      # already returns appointment_no
     return AppointmentOut(**appt)
 
 
 @app.patch("/appointments/{appointment_id}", response_model=AppointmentOut)
 async def patch_appt(appointment_id: str, body: AppointmentPatch):
-    appt = await update_meeting(
+    await update_meeting(
         appointment_id=appointment_id,
         start=body.start,
         end=body.end,
         status=body.status,
         request_text=body.request_text,
     )
-    # update_meeting returns partial — expand to full
-    full = await read_meeting(appointment_id)
+    full = await read_meeting(appointment_id)      # return full row (with appointment_no)
     return AppointmentOut(**full)
 
 
@@ -414,6 +416,7 @@ async def user_appts(user_id: str):
             out.append(
                 AppointmentOut(
                     id=str(a.id),
+                    appointment_no=a.appointment_no,         # ← include number
                     user_id=str(a.user_id),
                     tech_id=str(a.tech_id),
                     start=a.start_ts,
@@ -504,7 +507,6 @@ async def get_user(user_id: str):
         )
 
 
-
 @app.get("/appointments", response_model=List[AppointmentOut])
 async def list_appointments(
     user_id: Optional[str] = None,
@@ -562,6 +564,7 @@ async def list_appointments(
         return [
             AppointmentOut(
                 id=str(a.id),
+                appointment_no=a.appointment_no,           # ← include number
                 user_id=str(a.user_id),
                 tech_id=str(a.tech_id),
                 start=a.start_ts,
@@ -573,7 +576,9 @@ async def list_appointments(
             )
             for a in rows
         ]
-    
+
+
+# (Your file had a duplicate /appointments route; keeping it in sync just in case)
 @app.get("/appointments", response_model=List[AppointmentOut])
 async def list_appointments(
     user_id: Optional[str] = None,
@@ -586,13 +591,6 @@ async def list_appointments(
     offset: int = Query(0, ge=0),
     order: Literal["asc", "desc"] = "asc",
 ):
-    """
-    List appointments with simple filters and pagination.
-
-    Overlap logic for ranges:
-      - if date_from is set: end_ts > date_from
-      - if date_to   is set: start_ts < date_to
-    """
     async with Session() as db:
         stmt = select(Appointment)
 
@@ -629,6 +627,7 @@ async def list_appointments(
         out: List[AppointmentOut] = [
             AppointmentOut(
                 id=str(a.id),
+                appointment_no=a.appointment_no,           # ← include number
                 user_id=str(a.user_id),
                 tech_id=str(a.tech_id),
                 start=a.start_ts,
@@ -641,7 +640,8 @@ async def list_appointments(
             for a in rows
         ]
         return out
-    
+
+
 # ---------------------------
 # Holds (temporary reservations)
 # ---------------------------

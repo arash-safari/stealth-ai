@@ -1,4 +1,3 @@
-# services/schedule_service.py
 """
 Scheduling service — Python + SQLAlchemy (Postgres) + optional Google Calendar
 --------------------------------------------------------------------
@@ -21,6 +20,7 @@ from typing import Dict, List, Optional, Tuple, TypedDict
 
 from zoneinfo import ZoneInfo
 from sqlalchemy import select, text as sql_text, delete, update
+from sqlalchemy.ext.asyncio import AsyncSession  # <-- added
 
 from db.models import (
     Session,
@@ -283,6 +283,24 @@ async def hold_slot(
         return {"id": str(h.id), "tech_id": tech_id, "start": start, "end": end, "expires_at": expires_at}
 
 
+# ---------- Helper: resolve by UUID or numeric appointment_no ----------
+async def _resolve_appointment(db: AsyncSession, ref: str) -> Optional[Appointment]:
+    """Return Appointment by internal UUID or by public numeric appointment_no."""
+    # Try UUID first
+    try:
+        appt = await db.get(Appointment, uuid.UUID(ref))
+        if appt:
+            return appt
+    except (ValueError, TypeError, AttributeError):
+        pass
+    # Try numeric appointment_no
+    try:
+        number = int(ref)
+    except (ValueError, TypeError):
+        return None
+    return await db.scalar(select(Appointment).where(Appointment.appointment_no == number))
+
+
 async def create_meeting(
     *,
     user_id: str,
@@ -344,6 +362,7 @@ async def create_meeting(
 
         return {
             "id": str(a.id),
+            "appointment_no": getattr(a, "appointment_no", None),  # <-- added
             "user_id": str(a.user_id),
             "tech_id": str(a.tech_id),
             "start": a.start_ts,
@@ -356,21 +375,28 @@ async def create_meeting(
 
 
 async def read_meeting(appointment_id: str):
+    """
+    Fetch an appointment by either:
+      - UUID primary key (internal), or
+      - numeric public Appointment ID (appointment_no)
+    """
     async with Session() as db:
-        a = await db.get(Appointment, uuid.UUID(appointment_id))
-        if not a:
+        appt = await _resolve_appointment(db, appointment_id)
+        if appt is None:
             raise RuntimeError("Appointment not found")
+
         return {
-            "id": str(a.id),
-            "user_id": str(a.user_id),
-            "tech_id": str(a.tech_id),
-            "start": a.start_ts,
-            "end": a.end_ts,
-            "priority": a.priority,
-            "status": a.status,
-            "request_text": a.request_text,
-            "google_event_id": a.google_event_id,
-            "hangout_link": a.hangout_link,
+            "id": str(appt.id),
+            "appointment_no": getattr(appt, "appointment_no", None),
+            "user_id": str(appt.user_id),
+            "tech_id": str(appt.tech_id),
+            "start": appt.start_ts,
+            "end": appt.end_ts,
+            "priority": appt.priority,
+            "status": appt.status,
+            "request_text": appt.request_text,
+            "google_event_id": appt.google_event_id,
+            "hangout_link": appt.hangout_link,
         }
 
 
@@ -383,7 +409,7 @@ async def update_meeting(
     request_text: Optional[str] = None,
 ):
     async with Session() as db:
-        a = await db.get(Appointment, uuid.UUID(appointment_id))
+        a = await _resolve_appointment(db, appointment_id)  # <-- accepts either form
         if not a:
             raise RuntimeError("Appointment not found")
         t = await db.get(Tech, a.tech_id)
@@ -423,6 +449,7 @@ async def update_meeting(
                 await db.commit()
         return {
             "id": str(a.id),
+            "appointment_no": getattr(a, "appointment_no", None),  # <-- added for convenience
             "start": a.start_ts,
             "end": a.end_ts,
             "status": a.status,
@@ -432,7 +459,7 @@ async def update_meeting(
 
 async def cancel_meeting(appointment_id: str):
     async with Session() as db:
-        a = await db.get(Appointment, uuid.UUID(appointment_id))
+        a = await _resolve_appointment(db, appointment_id)  # <-- accepts either form
         if not a:
             raise RuntimeError("Appointment not found")
         t = await db.get(Tech, a.tech_id)
@@ -458,6 +485,11 @@ async def create_earliest_meeting(
         priority=priority,
         request_text=request_text,
     )
+
+
+async def get_appointment_by_no(session: AsyncSession, number: int) -> Optional[Appointment]:
+    stmt = select(Appointment).where(Appointment.appointment_no == number)
+    return await session.scalar(stmt)
 
 
 # --------------- Bulk availability publish (for a tech) ---------------

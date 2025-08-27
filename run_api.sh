@@ -48,7 +48,7 @@ if ! docker inspect "$DB_CONTAINER" >/dev/null 2>&1; then
     -e POSTGRES_USER="$DB_USER" \
     -e POSTGRES_PASSWORD="$DB_PASSWORD" \
     -e POSTGRES_DB="$DB_NAME" \
-    -p "$DB_PORT:55432" \
+    -p "$DB_PORT:5432" \
     -v "$PGDATA_DIR":/var/lib/postgresql/data \
     --health-cmd="pg_isready -U $DB_USER -d $DB_NAME || exit 1" \
     --health-interval=5s \
@@ -134,3 +134,4 @@ exec "${CMD[@]}"
 if [[ "$RELOAD" == "1" ]]; then
   CMD+=("--reload" "--reload-exclude" ".pgdata/*")
 fi
+
