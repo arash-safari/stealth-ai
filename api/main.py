@@ -594,3 +594,45 @@ async def list_appointments(
 # ---------------------------
 # Holds (temporary reservations)
 # ---------------------------
+@app.get("/users", response_model=List[UserOut])
+async def list_users(
+    q: Optional[str] = Query(
+        None,
+        description="Case-insensitive search in name/phone/email"
+    ),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    order: Literal["asc", "desc"] = "asc",
+):
+    async with Session() as db:
+        stmt = select(User)
+
+        if q:
+            like = f"%{q.strip()}%"
+            # .ilike works across most backends (emulated where needed)
+            stmt = stmt.where(
+                (User.full_name.ilike(like)) |
+                (User.phone.ilike(like)) |
+                (User.email.ilike(like))
+            )
+
+        # Order by a stable, non-nullable field
+        stmt = stmt.order_by(
+            User.full_name.asc() if order == "asc" else User.full_name.desc()
+        )
+
+        if offset:
+            stmt = stmt.offset(offset)
+        if limit:
+            stmt = stmt.limit(limit)
+
+        rows = (await db.execute(stmt)).scalars().all()
+        return [
+            UserOut(
+                id=str(u.id),
+                full_name=u.full_name,
+                phone=u.phone,
+                email=u.email,
+            )
+            for u in rows
+        ]
