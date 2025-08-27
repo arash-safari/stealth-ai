@@ -5,12 +5,15 @@ from typing import Annotated, Optional
 import yaml
 from dotenv import load_dotenv
 from pydantic import Field
+from livekit.api.twirp_client import TwirpError, TwirpErrorCode
 
 from livekit.agents import JobContext, WorkerOptions, cli
 from livekit.agents.llm import function_tool
 from livekit.agents.voice import Agent, AgentSession, RunContext
 from livekit.agents.voice.room_io import RoomInputOptions
 from livekit.plugins import cartesia, deepgram, openai, silero
+from livekit.agents import get_job_context
+from livekit import api
 
 import uuid
 from datetime import datetime, timedelta, time
@@ -22,6 +25,7 @@ from db.models import AppointmentStatus, RequestPriority
 # --- NEW: datetime & enum helpers
 from datetime import datetime, timezone
 from typing import Optional, Dict
+import asyncio
 
 def _dt_utc(s: Optional[str]) -> Optional[datetime]:
     if not s:
@@ -59,6 +63,45 @@ _STATUS: Dict[str, AppointmentStatus] = {
     "complete": getattr(AppointmentStatus, "complete", AppointmentStatus.scheduled),
     "canceled": AppointmentStatus.canceled,
 }
+
+async def hangup_call() -> str:
+    ctx = get_job_context()
+    if ctx is None:
+        logger.warning("hangup_call(): no JobContext; nothing to do")
+        return "no_job_ctx"
+
+    room_name = getattr(ctx.room, "name", None)
+    logger.info("hangup_call(): room=%s", room_name)
+
+    # Try to end the call for everyone
+    try:
+        if room_name:
+            await ctx.api.room.delete_room(api.DeleteRoomRequest(room=room_name))
+            logger.info("hangup_call(): room deleted")
+        else:
+            logger.info("hangup_call(): no room name; skipping delete_room")
+    except TwirpError as e:
+        # Treat already-closed room as success
+        if e.code == TwirpErrorCode.NOT_FOUND or getattr(e, "status", None) == 404:
+            logger.info("hangup_call(): room already gone (404) — treating as success")
+        else:
+            logger.warning("hangup_call(): delete_room failed: %s", e)
+
+    # IMPORTANT: shutdown is **sync** — do NOT await it
+    ctx.shutdown(reason="hangup")
+    return "shutdown"
+
+async def scrub_all_histories(context: RunContext) -> None:
+    """Keep only system messages in every agent's chat context."""
+    u = context.userdata
+    tasks = []
+    for agent in u.agents.values():
+        ctx = agent.chat_ctx.copy()
+        # retain only system messages (instructions)
+        ctx.items = [itm for itm in ctx.items if getattr(itm, "role", "") == "system"]
+        tasks.append(agent.update_chat_ctx(ctx))
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 # ------------------------------------------------------------
 # Multi‑agent voice system for a Plumbing Company contact center
@@ -177,6 +220,42 @@ class UserData:
             },
         }
         return yaml.dump(data, sort_keys=False)
+
+def scrub_user_data(u: UserData) -> None:
+    # Contact
+    u.customer_name = None
+    u.customer_phone = None
+    u.customer_email = None
+
+    # Address
+    u.street = u.unit = u.city = u.state = u.postal_code = None
+
+    # Job details
+    u.problem_description = None
+    u.urgency = None
+
+    # Appointment
+    u.appointment_id = None
+    u.appointment_date = None
+    u.appointment_window = None
+    u.appointment_status = None
+
+    # Parts / cart
+    u.cart.clear()
+    u.cart_total = 0.0
+
+    # Pricing / estimate
+    u.estimate_low = None
+    u.estimate_high = None
+
+    # Payment (wipe first!)
+    u.card_number = None
+    u.card_expiry = None
+    u.card_cvv = None
+    u.amount_authorized = None
+
+    # Agent cross-refs
+    u.prev_agent = None
 
 
 # =========================
@@ -621,6 +700,9 @@ class Router(BaseAgent):
                 "Triage the caller and route them: booking, reschedule, cancel, "
                 "parts/product requests, status/ETA, pricing/estimate, billing, or operator.\n"
                 "Ask minimal questions to decide, then use a tool to transfer."
+                "If the caller says they're done (e.g., 'no, that's all', 'thank you, bye'), "
+                "say a brief goodbye and CALL the end_call tool to hang up."
+
             ),
             llm=openai.LLM(parallel_tool_calls=False),
             tts=openai.TTS(model="gpt-4o-mini-tts", voice="nova"),
@@ -666,7 +748,23 @@ class Router(BaseAgent):
         """User has another request (not covered)."""
         return await self._transfer_to_agent("operator", context)
 
+    @function_tool()
+    async def end_call(self, context: RunContext) -> str:
+        handle = await context.session.say(
+            "Thanks for calling Ali Plumber Company. Goodbye!",
+            allow_interruptions=False,
+        )
+        if handle:
+            await handle.wait_for_playout()
 
+        # scrub PII + per-agent histories
+        scrub_user_data(context.userdata)          # you added this earlier
+        await scrub_all_histories(context)         # <- clears message history
+
+        # hang up & shut down (404-safe)
+        result = await hangup_call()
+        logger.info("end_call(): hangup result=%s; userdata & histories scrubbed", result)
+        return f"Call ended ({result})."    
 # -------------------
 # Booking agent
 # -------------------
