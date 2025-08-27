@@ -17,7 +17,7 @@ from typing import Literal  # already present
 # --- Your project imports ---
 from db.models import (
     Session,
-    Tech, Skill, TechSkill, TechShift, Appointment, User,
+    Tech, Skill, TechSkill, TechShift, Appointment, User, Address,
     AppointmentStatus, RequestPriority,
 )
 # Scheduling core
@@ -148,6 +148,25 @@ class UserOut(BaseModel):
     phone: str
     email: Optional[str] = None
 
+class AddressOut(BaseModel):
+    id: str
+    label: Optional[str] = None
+    line1: str
+    line2: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    postal_code: Optional[str] = None
+    is_default: bool = False
+    created_at: datetime
+    updated_at: datetime
+
+
+class UserOut(BaseModel):
+    id: str
+    full_name: str
+    phone: str
+    email: Optional[str] = None
+    addresses: List[AddressOut] = Field(default_factory=list) 
 
 # ---------------------------
 # Helpers
@@ -451,7 +470,39 @@ async def get_user(user_id: str):
         u = await db.get(User, uuid.UUID(user_id))
         if not u:
             raise HTTPException(404, "User not found")
-        return UserOut(id=str(u.id), full_name=u.full_name, phone=u.phone, email=u.email)
+
+        addr_rows = (
+            await db.execute(
+                select(Address)
+                .where(Address.user_id == u.id)
+                .order_by(Address.is_default.desc(), Address.created_at.desc())
+            )
+        ).scalars().all()
+
+        addresses = [
+            AddressOut(
+                id=str(a.id),
+                label=a.label,
+                line1=a.line1,
+                line2=a.line2,
+                city=a.city,
+                state=a.state,
+                postal_code=a.postal_code,
+                is_default=a.is_default,
+                created_at=a.created_at,
+                updated_at=a.updated_at,
+            )
+            for a in addr_rows
+        ]
+
+        return UserOut(
+            id=str(u.id),
+            full_name=u.full_name,
+            phone=u.phone,
+            email=u.email,
+            addresses=addresses,
+        )
+
 
 
 @app.get("/appointments", response_model=List[AppointmentOut])
@@ -596,10 +647,7 @@ async def list_appointments(
 # ---------------------------
 @app.get("/users", response_model=List[UserOut])
 async def list_users(
-    q: Optional[str] = Query(
-        None,
-        description="Case-insensitive search in name/phone/email"
-    ),
+    q: Optional[str] = Query(None, description="Case-insensitive search in name/phone/email"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     order: Literal["asc", "desc"] = "asc",
@@ -609,30 +657,58 @@ async def list_users(
 
         if q:
             like = f"%{q.strip()}%"
-            # .ilike works across most backends (emulated where needed)
             stmt = stmt.where(
                 (User.full_name.ilike(like)) |
                 (User.phone.ilike(like)) |
                 (User.email.ilike(like))
             )
 
-        # Order by a stable, non-nullable field
-        stmt = stmt.order_by(
-            User.full_name.asc() if order == "asc" else User.full_name.desc()
-        )
+        stmt = stmt.order_by(User.full_name.asc() if order == "asc" else User.full_name.desc())
 
         if offset:
             stmt = stmt.offset(offset)
         if limit:
             stmt = stmt.limit(limit)
 
-        rows = (await db.execute(stmt)).scalars().all()
+        users = (await db.execute(stmt)).scalars().all()
+        if not users:
+            return []
+
+        user_ids = [u.id for u in users]
+
+        addr_rows = (
+            await db.execute(
+                select(Address)
+                .where(Address.user_id.in_(user_ids))
+                .order_by(Address.is_default.desc(), Address.created_at.desc())
+            )
+        ).scalars().all()
+
+        # group addresses by user_id
+        addr_map: dict[uuid.UUID, List[AddressOut]] = {}
+        for a in addr_rows:
+            addr_map.setdefault(a.user_id, []).append(
+                AddressOut(
+                    id=str(a.id),
+                    label=a.label,
+                    line1=a.line1,
+                    line2=a.line2,
+                    city=a.city,
+                    state=a.state,
+                    postal_code=a.postal_code,
+                    is_default=a.is_default,
+                    created_at=a.created_at,
+                    updated_at=a.updated_at,
+                )
+            )
+
         return [
             UserOut(
                 id=str(u.id),
                 full_name=u.full_name,
                 phone=u.phone,
                 email=u.email,
+                addresses=addr_map.get(u.id, []),
             )
-            for u in rows
+            for u in users
         ]
