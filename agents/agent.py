@@ -184,7 +184,7 @@ class UserData:
 # =========================
 
 @function_tool()
-async def svc_get_available_times(
+async def get_available_times(
     context: RunContext,
     skill: str,
     duration_min: int = 120,
@@ -238,32 +238,138 @@ async def svc_hold_slot(
     return yaml.dump(res, sort_keys=False)
 
 
+def _parse_window_to_utc(date_str: str, window: str) -> tuple[datetime, datetime]:
+    # window="HH:MM-HH:MM"
+    try:
+        start_s, end_s = window.split("-")
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        s_local = datetime.combine(d, datetime.strptime(start_s, "%H:%M").time())
+        e_local = datetime.combine(d, datetime.strptime(end_s, "%H:%M").time())
+    except Exception as e:
+        raise ValueError(f"Invalid date/window. Expected YYYY-MM-DD and HH:MM-HH:MM. Error: {e}")
+    # treat as UTC if no tz info is available in UserData
+    s = s_local.replace(tzinfo=timezone.utc)
+    e = e_local.replace(tzinfo=timezone.utc)
+    return s, e
+
+
+# =========================
+# Book using ONLY UserData
+# =========================
 @function_tool()
-async def svc_create_meeting(
+async def create_meeting(
     context: RunContext,
-    user_id: str,
-    tech_id: str,
-    start: str,
-    end: str,
-    priority: str = "P3",
-    request_text: Optional[str] = None,
+    skill: Optional[str] = "plumbing",     # pick your default skill name
+    duration_min: int = 120,
 ) -> str:
-    pr = _PRIO.get(priority.upper(), RequestPriority.P3)
+    """
+    Create a meeting based entirely on UserData:
+      - find/create user by phone
+      - use appointment_date + appointment_window
+      - (optionally) save default address
+      - find a slot in that window for the given skill
+      - create the appointment
+    """
+    u: UserData = context.userdata
+
+    # --- required fields ---
+    missing = []
+    if not u.customer_phone: missing.append("customer_phone")
+    if not u.customer_name: missing.append("customer_name")
+    if not u.appointment_date: missing.append("appointment_date (YYYY-MM-DD)")
+    if not u.appointment_window: missing.append('appointment_window ("HH:MM-HH:MM")')
+    if missing:
+        return f"Missing required user data: {', '.join(missing)}"
+
+    # --- resolve or create user ---
+    existing = await users.get_user_by_phone(u.customer_phone)
+    if existing:
+        user_id = existing["id"]
+    else:
+        created = await users.create_user(full_name=u.customer_name, phone=u.customer_phone, email=u.customer_email)
+        user_id = created["id"]
+
+    # --- ensure default address if provided ---
+    has_any_address = any([u.street, u.city, u.state, u.postal_code, u.unit])
+    if has_any_address:
+        # only add if no default exists yet
+        default_addr = await users.get_default_address(user_id)
+        if not default_addr:
+            try:
+                await users.add_address(
+                    user_id=user_id,
+                    line1=(u.street or "Address line 1"),
+                    line2=u.unit,
+                    city=u.city,
+                    state=u.state,
+                    postal_code=u.postal_code,
+                    label="Service",
+                    is_default=True,
+                )
+            except Exception:
+                # non-fatal; carry on
+                pass
+
+    # --- compute requested window in UTC ---
+    try:
+        win_start, win_end = _parse_window_to_utc(u.appointment_date, u.appointment_window)
+    except Exception as e:
+        return f"Invalid appointment date/window: {e}"
+
+    # map urgency -> RequestPriority
+    urgency = (u.urgency or "normal").lower()
+    pr = RequestPriority.P1 if urgency == "emergency" else RequestPriority.P2 if urgency == "urgent" else RequestPriority.P3
+
+    # --- find slots that fit entirely inside the chosen window ---
+    slots = await sched.get_available_times(
+        skill=skill or "plumbing",
+        duration_min=duration_min,
+        priority=pr,
+        date_from=win_start,
+        date_to=win_end,
+        limit=50,
+        respect_google_busy=True,
+    )
+
+    # pick the first slot fully contained in the window
+    chosen = None
+    for s in slots:
+        if s["start"] >= win_start and s["end"] <= win_end:
+            chosen = s
+            break
+
+    if not chosen:
+        return "No availability in the selected window. Please choose another window."
+
+    # --- create the appointment ---
+    req_text = (u.problem_description or "Plumbing service").strip()
+    if has_any_address:
+        req_text = f"{req_text} — Address: {u.address_str()}"
+
     res = await sched.create_meeting(
         user_id=user_id,
-        tech_id=tech_id,
-        start=_dt_utc(start),
-        end=_dt_utc(end),
+        tech_id=chosen["tech_id"],
+        start=chosen["start"],
+        end=chosen["end"],
         priority=pr,
-        request_text=request_text,
+        request_text=req_text,
     )
+
+    # stringify datetimes for LLM
     res["start"] = res["start"].isoformat()
     res["end"] = res["end"].isoformat()
-    return yaml.dump(res, sort_keys=False)
+    return yaml.dump(
+        {
+            "message": "Appointment created from UserData",
+            "user_id": user_id,
+            "appointment": res,
+        },
+        sort_keys=False,
+    )
 
 
 @function_tool()
-async def svc_read_meeting(context: RunContext, appointment_id: str) -> str:
+async def read_meeting(context: RunContext, appointment_id: str) -> str:
     res = await sched.read_meeting(appointment_id)
     res["start"] = res["start"].isoformat()
     res["end"] = res["end"].isoformat()
@@ -271,7 +377,7 @@ async def svc_read_meeting(context: RunContext, appointment_id: str) -> str:
 
 
 @function_tool()
-async def svc_update_meeting(
+async def update_meeting(
     context: RunContext,
     appointment_id: str,
     start: Optional[str] = None,
@@ -292,13 +398,13 @@ async def svc_update_meeting(
 
 
 @function_tool()
-async def svc_cancel_meeting(context: RunContext, appointment_id: str) -> str:
+async def cancel_meeting(context: RunContext, appointment_id: str) -> str:
     res = await sched.cancel_meeting(appointment_id)
     return yaml.dump(res, sort_keys=False)
 
 
 @function_tool()
-async def svc_create_earliest_meeting(
+async def create_earliest_meeting(
     context: RunContext,
     user_id: str,
     skill: str,
@@ -320,7 +426,7 @@ async def svc_create_earliest_meeting(
 
 
 @function_tool()
-async def svc_publish_availability_for_range(
+async def publish_availability_for_range(
     context: RunContext,
     tech_id: str,
     start_date: str,  # YYYY-MM-DD
@@ -357,7 +463,7 @@ async def usr_get_user(context: RunContext, user_id: str) -> str:
     return yaml.dump(res or {}, sort_keys=False)
 
 @function_tool()
-async def usr_get_user_by_phone(context: RunContext, phone: str) -> str:
+async def get_user_by_phone(context: RunContext, phone: str) -> str:
     res = await users.get_user_by_phone(phone)
     return yaml.dump(res or {}, sort_keys=False)
 
@@ -510,11 +616,14 @@ class Router(BaseAgent):
         super().__init__(
             instructions=(
                 "You are a friendly plumbing company receptionist.\n"
-                "Triage the caller and route them: booking, reschedule, cancel, parts/product requests, status/ETA, pricing/estimate, billing, or operator.\n"
+                "For your very first message, greet the caller and say: "
+                "'Welcome to Ali Plumber Company! How can I help you today?'\n"
+                "Triage the caller and route them: booking, reschedule, cancel, "
+                "parts/product requests, status/ETA, pricing/estimate, billing, or operator.\n"
                 "Ask minimal questions to decide, then use a tool to transfer."
             ),
             llm=openai.LLM(parallel_tool_calls=False),
-            tts=cartesia.TTS(voice=voices["router"]),
+            tts=openai.TTS(model="gpt-4o-mini-tts", voice="nova"),
         )
 
     @function_tool()
@@ -573,14 +682,22 @@ class Booking(BaseAgent):
     def __init__(self) -> None:
         super().__init__(
             instructions=(
-                "You are a booking agent. Collect: address, problem, urgency, preferred date.\n"
-                "Then find available 2-hour windows (9-17). Suggest 3-6 earliest options, handle customer choice, and confirm.\n"
-                "On confirmation, generate an appointment_id and set status=scheduled."
+                "Booking agent. Be concise and ask EXACTLY one question per turn.\n"
+                "Start with a brief hello, then ask for the next missing field only. After each answer, ask the next.\n"
+                "Collect (in order): name, phone (email optional), full service address (street, unit?, city, state, postal), "
+                "problem description, urgency (normal/urgent/emergency), preferred date.\n"
+                "When address+problem+urgency+preferred date are known, call get_available_times "
+                "(skill='plumbing', duration_min=120, priority: emergency→P1, urgent→P2, else P3) and show the 2–4 earliest windows "
+                "as a numbered list like: '1) Tue 14:00–16:00'. Ask: 'Which number works?'\n"
+                "After selection, confirm in ≤2 short sentences (date, window, address). If customer says yes, call create_meeting "
+                "with the chosen tech_id/start/end, priority, and a brief request_text (problem + address). Then read back the appointment id and window.\n"
+                "If no slots are available, ask a single follow-up: expand date range or try another day (yes/no). If user revises info, update and continue.\n"
+                "No small talk. Keep each message ≤2 sentences. Never ask multi-part questions."
             ),
-            tools=[update_name, update_phone, update_email, update_address, update_problem, to_router,
+            tools=[update_name, update_phone, update_email,
+                    update_address, update_problem, to_router,
                     # new
-                   usr_get_user_by_phone, usr_create_user, usr_get_default_address,
-                    svc_get_available_times, svc_hold_slot, svc_create_meeting, svc_create_earliest_meeting],
+                   get_available_times, create_meeting],
             # tts=cartesia.TTS(voice=voices["booking"]),
             tts = openai.TTS(model="gpt-4o-mini-tts", voice="ash")  
         )
@@ -666,7 +783,7 @@ class Reschedule(BaseAgent):
                 "You are a rescheduling agent. Verify appointment exists, offer new windows (reuse booking windows), then update and confirm."
             ),
             tools=[to_router,
-                   svc_read_meeting, svc_get_available_times, svc_update_meeting],
+                   read_meeting, get_available_times, update_meeting],
             tts=openai.TTS(model="gpt-4o-mini-tts", voice="nova"),
         )
         self._booking_helper = Booking()
@@ -717,7 +834,7 @@ class Cancel(BaseAgent):
             ),
             tools=[to_router,
                 #    new
-                   svc_read_meeting, svc_cancel_meeting],
+                   read_meeting, cancel_meeting],
             tts=openai.TTS(model="gpt-4o-mini-tts", voice="nova")  ,
         )
 
@@ -810,7 +927,7 @@ class Status(BaseAgent):
                 "You are a status agent. If the appointment is today, give an ETA within the chosen window. Otherwise, remind the scheduled date/window."
             ),
             tools=[to_router,
-                   svc_read_meeting],
+                   read_meeting],
             tts=openai.TTS(model="gpt-4o-mini-tts", voice="verse")  ,
         )
 
@@ -952,7 +1069,7 @@ async def entrypoint(ctx: JobContext):
     session = AgentSession[UserData](
         userdata=userdata,
         stt=deepgram.STT(),
-        llm=openai.LLM(),
+        llm=openai.LLM(model="gpt-4o"),
         # tts=cartesia.TTS(),
         tts=openai.TTS(model="gpt-4o-mini-tts", voice="ash"),
         vad=silero.VAD.load(),
