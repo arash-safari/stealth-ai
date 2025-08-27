@@ -26,6 +26,7 @@ from db.models import AppointmentStatus, RequestPriority
 from datetime import datetime, timezone
 from typing import Optional, Dict
 import asyncio
+from zoneinfo import ZoneInfo
 
 def _dt_utc(s: Optional[str]) -> Optional[datetime]:
     if not s:
@@ -271,25 +272,101 @@ async def get_available_times(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     limit: int = 6,
-    respect_google_busy: bool = True,
+    respect_google_busy: Optional[bool] = True,   # accept None safely
 ) -> str:
+    skill = "drain"
     pr = _PRIO.get(priority.upper(), RequestPriority.P3)
+
+    # sanitize inputs coming from the LLM / JSON
+    lim = max(1, int(limit or 6))
+    dur = max(1, int(duration_min or 120))
+    # if caller sends null, default to True (keep Google free/busy on)
+    respect_busy = True if respect_google_busy is None else bool(respect_google_busy)
+
     slots = await sched.get_available_times(
         skill=skill,
-        duration_min=duration_min,
+        duration_min=dur,
         priority=pr,
         date_from=_dt_utc(date_from),
         date_to=_dt_utc(date_to),
-        limit=limit,
-        respect_google_busy=respect_google_busy,
+        limit=lim,
+        respect_google_busy=respect_busy,
     )
-    # stringify datetimes for the LLM
+
+    # defensive cap (even if the scheduler misbehaved)
+    slots = slots[:lim]
+
     out = [
-        {"tech_id": s["tech_id"], "start": s["start"].isoformat(), "end": s["end"].isoformat(), "source": s["source"]}
+        {
+            "tech_id": s["tech_id"],
+            "start": s["start"].isoformat(),
+            "end": s["end"].isoformat(),
+            "source": s["source"],
+        }
         for s in slots
     ]
     return yaml.dump({"slots": out}, sort_keys=False)
 
+@function_tool()
+async def get_nearest_available_time(
+    context: RunContext,
+    skill: str,
+    duration_min: int = 120,
+    priority: str = "P3",
+    after: Optional[str] = None,              # ISO or "YYYY-MM-DDTHH:MM"; defaults to now UTC
+    respect_google_busy: Optional[bool] = True,
+) -> str:
+    """
+    Return the earliest/nearest available slot within the next 7 days.
+    YAML response:
+      nearest_slot:
+        tech_id: "<uuid>"
+        start: "2025-08-27T17:00:00+00:00"
+        end:   "2025-08-27T19:00:00+00:00"
+        source: "db" | "db+google"
+    """
+    skill = "drain"
+    pr = _PRIO.get(priority.upper(), RequestPriority.P3)
+
+    # sanitize inputs
+    dur = max(1, int(duration_min or 120))
+    respect_busy = True if respect_google_busy is None else bool(respect_google_busy)
+
+    start_from = _dt_utc(after) if after else datetime.now(timezone.utc)
+    end_to = start_from + timedelta(days=7)   # <— always consider one week
+
+    # Pull plenty of slots within the 1-week window, then sort locally
+    slots = await sched.get_available_times(
+        skill=skill,
+        duration_min=dur,
+        priority=pr,                 # priority still influences internal logic, but date_to caps horizon
+        date_from=start_from,
+        date_to=end_to,
+        limit=200,                   # generous cap; we’ll sort and pick the first
+        respect_google_busy=respect_busy,
+    )
+
+    if not slots:
+        return yaml.dump(
+            {
+                "nearest_slot": None,
+                "message": "No availability found in the next 7 days.",
+            },
+            sort_keys=False,
+        )
+
+    slots.sort(key=lambda s: s["start"])       # ensure earliest first
+
+    s = slots[0]
+    out = {
+        "nearest_slot": {
+            "tech_id": s["tech_id"],
+            "start": s["start"].isoformat(),
+            "end": s["end"].isoformat(),
+            "source": s["source"],
+        }
+    }
+    return yaml.dump(out, sort_keys=False)
 
 @function_tool()
 async def svc_hold_slot(
@@ -335,43 +412,78 @@ def _parse_window_to_utc(date_str: str, window: str) -> tuple[datetime, datetime
 # =========================
 # Book using ONLY UserData
 # =========================
+
 @function_tool()
-async def create_meeting(
+async def get_today(
     context: RunContext,
-    skill: Optional[str] = "plumbing",     # pick your default skill name
-    duration_min: int = 120,
+    tz: Optional[str] = "UTC",
+    fmt: Optional[str] = "%Y-%m-%d",
 ) -> str:
     """
-    Create a meeting based entirely on UserData:
-      - find/create user by phone
-      - use appointment_date + appointment_window
-      - (optionally) save default address
-      - find a slot in that window for the given skill
-      - create the appointment
+    Return today's date/time in a given IANA timezone.
+    - tz: IANA name like 'America/Los_Angeles' (defaults to UTC if invalid/missing)
+    - fmt: strftime format for the 'date' field (default %Y-%m-%d)
+
+    YAML response example:
+      today:
+        date: "2025-08-27"
+        iso: "2025-08-27T17:23:45.123456+00:00"
+        weekday: "Wednesday"
+        tz: "UTC"
+        epoch: 1693157025
+    """
+    try:
+        zone = ZoneInfo(tz) if tz else timezone.utc
+    except Exception:
+        zone = timezone.utc
+        tz = "UTC"
+
+    now = datetime.now(zone)
+    out = {
+        "today": {
+            "date": now.strftime(fmt or "%Y-%m-%d"),
+            "iso": now.isoformat(),
+            "weekday": now.strftime("%A"),
+            "tz": tz or "UTC",
+            "epoch": int(now.timestamp()),
+        }
+    }
+    return yaml.dump(out, sort_keys=False)
+
+@function_tool()
+async def create_appointment(
+    context: RunContext,
+    skill: Optional[str] = "plumbing",
+    duration_min: int = 120,
+    date_from: Optional[str] = None,     # ISO or "YYYY-MM-DDTHH:MM"
+    date_to: Optional[str] = None,       # ISO or "YYYY-MM-DDTHH:MM"
+    respect_google_busy: Optional[bool] = True,
+) -> str:
+    skill = "water heater"
+    """
+    Create an appointment inside a specified window.
+    - If date_from/date_to are provided, they define the search window.
+    - Otherwise, falls back to UserData.appointment_date + appointment_window ("HH:MM-HH:MM").
+    - If only one bound is provided, the other is inferred from duration_min.
     """
     u: UserData = context.userdata
 
-    # --- required fields ---
+    # --- required contact fields ---
     missing = []
     if not u.customer_phone: missing.append("customer_phone")
     if not u.customer_name: missing.append("customer_name")
-    if not u.appointment_date: missing.append("appointment_date (YYYY-MM-DD)")
-    if not u.appointment_window: missing.append('appointment_window ("HH:MM-HH:MM")')
     if missing:
         return f"Missing required user data: {', '.join(missing)}"
 
-    # --- resolve or create user ---
+    # --- resolve/create user ---
     existing = await users.get_user_by_phone(u.customer_phone)
-    if existing:
-        user_id = existing["id"]
-    else:
-        created = await users.create_user(full_name=u.customer_name, phone=u.customer_phone, email=u.customer_email)
-        user_id = created["id"]
+    user_id = existing["id"] if existing else (await users.create_user(
+        full_name=u.customer_name, phone=u.customer_phone, email=u.customer_email
+    ))["id"]
 
     # --- ensure default address if provided ---
     has_any_address = any([u.street, u.city, u.state, u.postal_code, u.unit])
     if has_any_address:
-        # only add if no default exists yet
         default_addr = await users.get_default_address(user_id)
         if not default_addr:
             try:
@@ -386,37 +498,57 @@ async def create_meeting(
                     is_default=True,
                 )
             except Exception:
-                # non-fatal; carry on
-                pass
+                pass  # non-fatal
 
-    # --- compute requested window in UTC ---
-    try:
-        win_start, win_end = _parse_window_to_utc(u.appointment_date, u.appointment_window)
-    except Exception as e:
-        return f"Invalid appointment date/window: {e}"
+    # --- determine booking window (UTC) ---
+    win_start = win_end = None
 
-    # map urgency -> RequestPriority
+    # Prefer explicit window if supplied
+    if date_from or date_to:
+        s = _dt_utc(date_from) if date_from else None
+        e = _dt_utc(date_to) if date_to else None
+
+        # Infer the missing bound from duration_min
+        if s and not e:
+            e = s + timedelta(minutes=max(1, int(duration_min or 120)))
+        elif e and not s:
+            s = e - timedelta(minutes=max(1, int(duration_min or 120)))
+
+        if not (s and e):
+            return "Invalid window: need date_from or date_to (or both)."
+
+        if e <= s:
+            return "Invalid window: date_to must be later than date_from."
+
+        win_start, win_end = s, e
+    else:
+        # Fall back to UserData date + "HH:MM-HH:MM" window
+        if not (u.appointment_date and u.appointment_window):
+            return "Missing window: provide date_from/date_to or set appointment_date and appointment_window."
+        try:
+            win_start, win_end = _parse_window_to_utc(u.appointment_date, u.appointment_window)
+        except Exception as e:
+            return f"Invalid appointment date/window: {e}"
+
+    # --- priority from urgency ---
     urgency = (u.urgency or "normal").lower()
     pr = RequestPriority.P1 if urgency == "emergency" else RequestPriority.P2 if urgency == "urgent" else RequestPriority.P3
 
-    # --- find slots that fit entirely inside the chosen window ---
+    # --- search availability inside the window ---
+    dur = max(1, int(duration_min or 120))
+    respect_busy = True if respect_google_busy is None else bool(respect_google_busy)
+
     slots = await sched.get_available_times(
         skill=skill or "plumbing",
-        duration_min=duration_min,
+        duration_min=dur,
         priority=pr,
         date_from=win_start,
         date_to=win_end,
         limit=50,
-        respect_google_busy=True,
+        respect_google_busy=respect_busy,
     )
 
-    # pick the first slot fully contained in the window
-    chosen = None
-    for s in slots:
-        if s["start"] >= win_start and s["end"] <= win_end:
-            chosen = s
-            break
-
+    chosen = next((s for s in slots if s["start"] >= win_start and s["end"] <= win_end), None)
     if not chosen:
         return "No availability in the selected window. Please choose another window."
 
@@ -434,15 +566,25 @@ async def create_meeting(
         request_text=req_text,
     )
 
-    # stringify datetimes for LLM
+    # keep UserData in sync
+    u.appointment_id = str(res.get("id") or res.get("appointment_id") or "")
+    u.appointment_status = "scheduled"
+    try:
+        # If UserData window wasn’t set earlier, set it from the chosen slot
+        s_iso = res["start"].isoformat() if hasattr(res["start"], "isoformat") else res["start"]
+        e_iso = res["end"].isoformat() if hasattr(res["end"], "isoformat") else res["end"]
+        s_dt = _dt_utc(s_iso)
+        e_dt = _dt_utc(e_iso)
+        u.appointment_date = s_dt.date().isoformat()
+        u.appointment_window = f"{s_dt.strftime('%H:%M')}-{e_dt.strftime('%H:%M')}"
+    except Exception:
+        pass
+
+    # stringify datetimes for YAML
     res["start"] = res["start"].isoformat()
     res["end"] = res["end"].isoformat()
     return yaml.dump(
-        {
-            "message": "Appointment created from UserData",
-            "user_id": user_id,
-            "appointment": res,
-        },
+        {"message": "Appointment created from UserData", "user_id": user_id, "appointment": res},
         sort_keys=False,
     )
 
@@ -780,22 +922,28 @@ class Booking(BaseAgent):
     def __init__(self) -> None:
         super().__init__(
             instructions=(
-                "Booking agent. Be concise and ask EXACTLY one question per turn.\n"
-                "Start with a brief hello, then ask for the next missing field only. After each answer, ask the next.\n"
-                "Collect (in order): name, phone (email optional), full service address (street, unit?, city, state, postal), "
-                "problem description, urgency (normal/urgent/emergency), preferred date.\n"
-                "When address+problem+urgency+preferred date are known, call get_available_times "
-                "(skill='plumbing', duration_min=120, priority: emergency→P1, urgent→P2, else P3) and show the 2–4 earliest windows "
-                "as a numbered list like: '1) Tue 14:00–16:00'. Ask: 'Which number works?'\n"
-                "After selection, confirm in ≤2 short sentences (date, window, address). If customer says yes, call create_meeting "
-                "with the chosen tech_id/start/end, priority, and a brief request_text (problem + address). Then read back the appointment id and window.\n"
-                "If no slots are available, ask a single follow-up: expand date range or try another day (yes/no). If user revises info, update and continue.\n"
-                "No small talk. Keep each message ≤2 sentences. Never ask multi-part questions."
+    "Booking agent. Be concise and ask EXACTLY one question per turn.\n"
+    "Start with a brief hello, then ask for the next missing field only. After each answer, ask the next.\n"
+    "Collect (in order): name, phone (email optional), full service address (street, unit?, city, state, postal), "
+    "problem description, urgency (normal/urgent/emergency), preferred date.\n"
+    "When address+problem+urgency+preferred date are known, call get_available_times "
+    "(skill='plumbing', duration_min=120, priority: emergency→P1, urgent→P2, else P3) and show the 2–4 earliest windows "
+    "as a numbered list like: '1) Tue 14:00–16:00'. Ask: 'Which number works?'\n"
+    "If the user asks for the earliest time or gives no preferred date, you may call get_nearest_available_time to find the soonest window.\n"
+    "Use get_today to obtain today's date/time when interpreting phrases like 'today' or 'tomorrow'.\n"
+    "When calling get_available_times, if date_from or date_to are not provided by the user, pass them as None.\n"
+    "After selection, confirm in ≤2 short sentences (date, window, address). If customer says yes, call create_appointment "
+    "with the chosen tech_id/start/end, priority, and a brief request_text (problem + address). Then read back the appointment id and window.\n"
+    "If no slots are available, ask a single follow-up: expand date range or try another day (yes/no). If user revises info, update and continue.\n"
+    "No small talk. Keep each message ≤2 sentences. Never ask multi-part questions."
             ),
             tools=[update_name, update_phone, update_email,
                     update_address, update_problem, to_router,
                     # new
-                   get_available_times, create_meeting],
+                    create_appointment,
+                    get_today,
+                    get_nearest_available_time,
+                    get_available_times],
             # tts=cartesia.TTS(voice=voices["booking"]),
             tts = openai.TTS(model="gpt-4o-mini-tts", voice="ash")  
         )
@@ -826,17 +974,17 @@ class Booking(BaseAgent):
             day_cursor += timedelta(days=1)
         return windows
 
-    @function_tool()
-    async def find_available_windows(
-        self,
-        context: RunContext,
-        preferred_date: Annotated[Optional[str], Field(description="Preferred YYYY-MM-DD")] = None,
-    ) -> str:
-        """Return earliest available 2-hour windows starting from preferred_date (if provided)."""
-        wins = self._generate_windows(preferred_date)
-        top = wins[:6]
-        self._last_suggested = top  # type: ignore[attr-defined]
-        return yaml.dump({"suggested_windows": top}, sort_keys=False)
+    # @function_tool()
+    # async def find_available_windows(
+    #     self,
+    #     context: RunContext,
+    #     preferred_date: Annotated[Optional[str], Field(description="Preferred YYYY-MM-DD")] = None,
+    # ) -> str:
+    #     """Return earliest available 2-hour windows starting from preferred_date (if provided)."""
+    #     wins = self._generate_windows(preferred_date)
+    #     top = wins[:6]
+    #     self._last_suggested = top  # type: ignore[attr-defined]
+    #     return yaml.dump({"suggested_windows": top}, sort_keys=False)
 
     @function_tool()
     async def choose_window(
