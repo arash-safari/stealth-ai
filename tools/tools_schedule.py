@@ -285,27 +285,45 @@ async def read_meeting(context: RunContext, appointment_no: str) -> str:
 @function_tool()
 async def update_meeting(
     context: RunContext,
-    appointment_id: str,
+    appointment_no: str,                 # <- keep this as the public number
     start: Optional[str] = None,
     end: Optional[str] = None,
     status: Optional[str] = None,
     request_text: Optional[str] = None,
 ) -> str:
+    # status mapping (robust to case / unknowns)
+    status_enum = None
+    if status:
+        try:
+            status_enum = _STATUS[status]
+        except KeyError:
+            try:
+                status_enum = _STATUS[status.upper()]
+            except KeyError:
+                status_enum = None  # ignore invalid status instead of raising
+
     res = await sched.update_meeting(
-        appointment_id=appointment_id,
+        appointment_no=str(appointment_no),          # <- ensure we pass the number
         start=_dt_utc(start) if start else None,
         end=_dt_utc(end) if end else None,
-        status=_STATUS[status] if status else None,
+        status=status_enum,
         request_text=request_text,
     )
-    res["start"] = res["start"].isoformat()
-    res["end"] = res["end"].isoformat()
+
+    # Normalize datetimes for YAML
+    if res.get("start") and hasattr(res["start"], "isoformat"):
+        res["start"] = res["start"].isoformat()
+    if res.get("end") and hasattr(res["end"], "isoformat"):
+        res["end"] = res["end"].isoformat()
     return yaml.dump(res, sort_keys=False)
 
-
 @function_tool()
-async def cancel_meeting(context: RunContext, appointment_id: str) -> str:
-    res = await sched.cancel_meeting(appointment_id)
+async def cancel_meeting(
+    context: RunContext,
+    appointment_no: str,          # <- changed from appointment_id to appointment_no
+) -> str:
+    # service accepts either UUID or number; we pass the public number explicitly
+    res = await sched.cancel_meeting(str(appointment_no))
     return yaml.dump(res, sort_keys=False)
 
 

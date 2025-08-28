@@ -1,15 +1,17 @@
 """
 Scheduling service — Python + SQLAlchemy (Postgres) + optional Google Calendar
 --------------------------------------------------------------------
+
 Exports:
   - get_available_times(...)
   - hold_slot(...)
   - create_meeting(...)
-  - read_meeting(...)
-  - update_meeting(...)
-  - cancel_meeting(...)
+  - read_meeting(...)                         # accepts UUID or number
+  - read_meeting_by_appointment_number(...)
+  - update_meeting(... by appointment_no)     # accepts number or UUID
+  - cancel_meeting(... by appointment_ref)    # accepts number or UUID
   - create_earliest_meeting(...)
-  - publish_availability_for_range(...)  # create TechShift windows in bulk
+  - publish_availability_for_range(...)
 """
 from __future__ import annotations
 
@@ -17,6 +19,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, time, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, TypedDict
+import re
 
 from zoneinfo import ZoneInfo
 from sqlalchemy import select, text as sql_text, delete, update
@@ -285,20 +288,37 @@ async def hold_slot(
 
 # ---------- Helper: resolve by UUID or numeric appointment_no ----------
 async def _resolve_appointment(db: AsyncSession, ref: str) -> Optional[Appointment]:
-    """Return Appointment by internal UUID or by public numeric appointment_no."""
-    # Try UUID first
+    """
+    Prefer public numeric appointment_no, then fall back to internal UUID.
+    Accepts strings like "12345" or "#12345"; ignores whitespace.
+    """
+    if ref is None:
+        return None
+    s = str(ref).strip()
+
+    # 1) Prefer public number
+    #    Allow a leading '#' or whitespace; reject if not purely digits after stripping.
+    m = re.fullmatch(r"#?(\d+)", s)
+    if m:
+        try:
+            number = int(m.group(1))
+            appt = await db.scalar(select(Appointment).where(Appointment.appointment_no == number))
+            if appt:
+                return appt
+        except Exception:
+            # fall through to UUID attempt
+            pass
+
+    # 2) Fallback to UUID (accepts 32-hex or hyphenated)
     try:
-        appt = await db.get(Appointment, uuid.UUID(ref))
+        u = uuid.UUID(s)
+        appt = await db.get(Appointment, u)
         if appt:
             return appt
     except (ValueError, TypeError, AttributeError):
         pass
-    # Try numeric appointment_no
-    try:
-        number = int(ref)
-    except (ValueError, TypeError):
-        return None
-    return await db.scalar(select(Appointment).where(Appointment.appointment_no == number))
+
+    return None
 
 
 async def create_meeting(
@@ -374,14 +394,14 @@ async def create_meeting(
         }
 
 
-async def read_meeting(appointment_id: str):
+async def read_meeting(appointment_no: str):
     """
     Fetch an appointment by either:
       - UUID primary key (internal), or
       - numeric public Appointment ID (appointment_no)
     """
     async with Session() as db:
-        appt = await _resolve_appointment(db, appointment_id)
+        appt = await _resolve_appointment(db, appointment_no)
         if appt is None:
             raise RuntimeError("Appointment not found")
 
@@ -402,14 +422,14 @@ async def read_meeting(appointment_id: str):
 
 async def update_meeting(
     *,
-    appointment_id: str,
+    appointment_no: str,
     start: Optional[datetime] = None,
     end: Optional[datetime] = None,
     status: Optional[AppointmentStatus] = None,
     request_text: Optional[str] = None,
 ):
     async with Session() as db:
-        a = await _resolve_appointment(db, appointment_id)  # <-- accepts either form
+        a = await _resolve_appointment(db, appointment_no)  # <-- accepts either form
         if not a:
             raise RuntimeError("Appointment not found")
         t = await db.get(Tech, a.tech_id)
@@ -457,17 +477,37 @@ async def update_meeting(
         }
 
 
-async def cancel_meeting(appointment_id: str):
+async def cancel_meeting(appointment_ref: str):
+    """
+    Cancel an appointment by either:
+      - public numeric appointment number, or
+      - internal UUID
+    Also removes the Google Calendar event if present.
+    """
     async with Session() as db:
-        a = await _resolve_appointment(db, appointment_id)  # <-- accepts either form
+        a = await _resolve_appointment(db, appointment_ref)
         if not a:
             raise RuntimeError("Appointment not found")
+
         t = await db.get(Tech, a.tech_id)
+
         a.status = AppointmentStatus.canceled
         await db.commit()
+
+        # Best-effort Google cleanup (don't fail cancellation if GCal fails)
         if a.google_event_id and t and t.google_calendar_id:
-            delete_event(t.google_calendar_id, a.google_event_id)
-        return {"ok": True}
+            try:
+                delete_event(t.google_calendar_id, a.google_event_id)
+            except Exception:
+                # swallow GCal errors; DB already shows canceled
+                pass
+
+        return {
+            "ok": True,
+            "appointment_no": getattr(a, "appointment_no", None),
+            "id": str(a.id),
+            "status": a.status,
+        }
 
 
 async def create_earliest_meeting(

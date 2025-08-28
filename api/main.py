@@ -385,7 +385,7 @@ async def get_appt(appointment_id: str):
 @app.patch("/appointments/{appointment_id}", response_model=AppointmentOut)
 async def patch_appt(appointment_id: str, body: AppointmentPatch):
     await update_meeting(
-        appointment_id=appointment_id,
+        appointment_no=appointment_id,
         start=body.start,
         end=body.end,
         status=body.status,
