@@ -168,7 +168,7 @@ async def create_appointment(
     date_to: Optional[str] = None,
     respect_google_busy: Optional[bool] = True,
 ) -> str:
-    skill = "water heater"  # preserve original override
+    skill = "drain"  # preserve original override
     u: UserData = context.userdata
 
     missing = []
