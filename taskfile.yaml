@@ -15,7 +15,7 @@ tasks:
       PYTHONUNBUFFERED: "1"
       LIVEKIT_LOG_LEVEL: "debug"
     cmds:
-      - uv run -m agents.agent console
+      - uv run -m agents.main console
 
   intent-dev:
     desc: Worker (no local audio required)
@@ -24,7 +24,7 @@ tasks:
       PYTHONUNBUFFERED: "1"
       LIVEKIT_LOG_LEVEL: "debug"
     cmds:
-      - uv run -m agents.agent dev
+      - uv run -m agents.main dev
 
   sip-lifecycle-dev:
     desc: Run the SIP lifecycle agent
