@@ -1,30 +1,64 @@
-## `agents/status.py`
-
+##  agents/status.py
+import yaml
+from datetime import datetime, timezone
 from livekit.plugins import openai
 from livekit.agents.llm import function_tool
+from livekit.agents.voice import RunContext
+
 from common.base_agent import BaseAgent
+from tools.tools_schedule import read_meeting
 
 class Status(BaseAgent):
     def __init__(self, voices: dict | None = None) -> None:
         super().__init__(
             instructions=(
-                "You are a status agent. If the appointment is today, give an ETA within the chosen window. Otherwise, remind the scheduled date/window."
+                "You are a status agent. Always look up the appointment via the scheduler service using the caller's appointment number. "
+                "If the appointment is today, give an ETA within the chosen window. Otherwise, remind the scheduled date/window."
             ),
-            tools=[],
+            tools=[read_meeting],
             tts=openai.TTS(model="gpt-4o-mini-tts", voice="verse"),
         )
 
     @function_tool()
-    async def check_status(self, context) -> str:
-        u = context.userdata
-        if not u.appointment_id or not u.appointment_date or not u.appointment_window:
-            return "No appointment found."
-        today = __import__("datetime").datetime.utcnow().date().isoformat()
-        if u.appointment_status == "canceled":
-            return f"Appointment {u.appointment_id} is canceled."
-        if u.appointment_date == today:
+    async def check_status(self, context: RunContext, ref: str) -> str:
+        """Check status by public appointment number (preferred) or UUID string."""
+        # Fetch fresh data from the schedule service (no reliance on context.userdata)
+        try:
+            yaml_str = await read_meeting(context,appointment_no =ref)
+        except Exception:
+            return "Appointment not found."
+
+        try:
+            data = yaml.safe_load(yaml_str) or {}
+        except Exception:
+            return "Could not parse appointment details."
+
+        appt_id = data.get("id")
+        appt_no = data.get("appointment_no")
+        status = str(data.get("status") or "").lower()
+        start_s = data.get("start")
+        end_s = data.get("end")
+        label = f"#{appt_no}" if appt_no is not None else (appt_id or "(unknown)")
+
+        # Parse window
+        try:
+            sdt = datetime.fromisoformat(start_s)
+            edt = datetime.fromisoformat(end_s)
+        except Exception:
+            return f"Appointment {label}: time info unavailable."
+
+        # Use UTC to match service outputs consistently
+        sdt_utc = sdt.astimezone(timezone.utc)
+        edt_utc = edt.astimezone(timezone.utc)
+        appt_date = sdt_utc.date().isoformat()
+        window = f"{sdt_utc.strftime('%H:%M')}-{edt_utc.strftime('%H:%M')}"
+        today = datetime.utcnow().date().isoformat()
+
+        if "canceled" in status:
+            return f"Appointment {label} is canceled."
+        if appt_date == today:
             return (
-                f"Technician scheduled today between {u.appointment_window}. "
+                f"Technician scheduled today between {window}. "
                 f"Current status: en route window. ETA within 30–90 minutes depending on traffic."
             )
-        return f"Appointment {u.appointment_id} is scheduled on {u.appointment_date} at {u.appointment_window}."
+        return f"Appointment {label} is scheduled on {appt_date} at {window}."

@@ -275,8 +275,8 @@ async def create_appointment(
 
 
 @function_tool()
-async def read_meeting(context: RunContext, appointment_id: str) -> str:
-    res = await sched.read_meeting(appointment_id)
+async def read_meeting(context: RunContext, appointment_no: str) -> str:
+    res = await sched.read_meeting_by_appointment_number(appointment_no)
     res["start"] = res["start"].isoformat()
     res["end"] = res["end"].isoformat()
     return yaml.dump(res, sort_keys=False)

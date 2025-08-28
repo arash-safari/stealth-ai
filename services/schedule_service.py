@@ -544,3 +544,27 @@ async def publish_availability_for_range(
 
         await db.commit()
         return {"shifts_created": created}
+
+async def read_meeting_by_appointment_number(appointment_no: int):
+    """
+    Fetch an appointment by its public numeric Appointment ID (appointment_no).
+    Returns the same shape as read_meeting(...).
+    """
+    async with Session() as db:
+        appt = await get_appointment_by_no(db, int(appointment_no))
+        if appt is None:
+            raise RuntimeError("Appointment not found")
+
+        return {
+            "id": str(appt.id),
+            "appointment_no": getattr(appt, "appointment_no", None),
+            "user_id": str(appt.user_id),
+            "tech_id": str(appt.tech_id),
+            "start": appt.start_ts,
+            "end": appt.end_ts,
+            "priority": appt.priority,
+            "status": appt.status,
+            "request_text": appt.request_text,
+            "google_event_id": appt.google_event_id,
+            "hangout_link": appt.hangout_link,
+        }
