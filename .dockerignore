@@ -10,3 +10,4 @@ dist
 build
 .coverage
 pytest_cache
+.pgdata

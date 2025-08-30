@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ------------------------------------------------------------
 # Ensure Postgres (Docker) is up, healthy, and reachable.
-# Re-uses env vars if set; otherwise falls back to sane defaults.
+# Re‑uses env vars if set; otherwise falls back to sane defaults.
 # ------------------------------------------------------------
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,7 +22,10 @@ DB_USER="${DB_USER:-plumber}"
 DB_PASSWORD="${DB_PASSWORD:-plumber}"
 DB_NAME="${DB_NAME:-plumbing}"
 DB_PORT="${DB_PORT:-55432}"
-PGDATA_DIR="${PGDATA_DIR:-$PROJECT_ROOT/.pgdata}"
+
+# Store PGDATA outside the project directory.  If PGDATA_DIR is already set,
+# the value is used; otherwise default to ~/.pgdata.
+PGDATA_DIR="${PGDATA_DIR:-$HOME/.pgdata}"
 
 # ---- sanity: docker available ----
 if ! command -v docker >/dev/null 2>&1; then
@@ -92,6 +95,6 @@ echo "📦 DB ready at: ${DATABASE_URL:-$DEFAULT_DATABASE_URL}"
 #     echo "🛠  Running Alembic migrations..."
 #     DATABASE_URL="${DATABASE_URL:-$DEFAULT_DATABASE_URL}" uv run alembic upgrade head
 #   else
-#     echo "ℹ️  Skipping migrations (install 'uv' to auto-run)."
+#     echo "ℹ️  Skipping migrations (install 'uv' to auto‑run)."
 #   fi
 # fi

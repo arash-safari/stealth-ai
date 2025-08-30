@@ -9,7 +9,7 @@ services:
     ports:
       - "55432:5432"
     volumes:
-      - ./.pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U plumber -d plumbing || exit 1"]
       interval: 5s
@@ -24,8 +24,11 @@ services:
     env_file:
       - .env.local
     environment:
-      # override so the app talks to the 'db' service, not localhost
       DATABASE_URL: postgresql+asyncpg://plumber:plumber@db:5432/plumbing?ssl=false
     ports:
       - "8000:8000"
     command: ["uv", "run", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# declare named volumes at the end of the file
+volumes:
+  pgdata:
