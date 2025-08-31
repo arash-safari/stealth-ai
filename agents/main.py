@@ -167,26 +167,25 @@ def build_tts(provider: str, model: str, voice: str):
 
 
 def build_deepgram_stt() -> deepgram.STT:
-    # Pull a language from YAML if you have one; default to en-US.
     dg_language = _cfg_get(CONFIG, "deepgram.language", "en-US")
-
-    # NOTE: Python plugin takes options directly on the constructor.
-    # It also runs its own KeepAlive task under the hood.
-    stt = deepgram.STT(
+    # Trade-offs:
+    # - punctuate/smart_format OFF -> faster finals, but less pretty text
+    # - no_delay ON -> send partials ASAP
+    # - endpointing_ms smaller -> earlier finalization after pauses
+    # - sample_rate: match your capture to avoid resampling
+    return deepgram.STT(
         model=DG_MODEL,                 # e.g., "nova-2-general"
         language=dg_language,           # e.g., "en-US"
-        interim_results=True,
-        punctuate=True,
-        smart_format=True,
-        sample_rate=DG_SAMPLE_RATE,     # e.g., 48000
-        no_delay=True,
-        endpointing_ms=25,
-        filler_words=True,
-        numerals=False,
+        interim_results=True,           # get partials quickly
+        no_delay=True,                  # flush partials immediately
+        endpointing_ms=80,              # 50–150ms is a good fast range
+        punctuate=False,                # faster finalization
+        smart_format=False,             # faster finalization
+        filler_words=False,             # shave a bit more post-processing
+        numerals=False,                 # keep off unless you need it
+        sample_rate=DG_SAMPLE_RATE,     # match 48000 if your input is 48k
         api_key=DEEPGRAM_API_KEY,
-        # energy_filter=True,  # optional: helps with silence handling
     )
-    return stt
 
 # ----------------------------------------------------------------------------
 # Helpers: robust retry with cancel, jitter, and backoff
