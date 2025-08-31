@@ -1,0 +1,51 @@
+openai:
+  llm_model: gpt-4o
+  tts_model: gpt-4o-mini-tts
+  default_voice: ash
+
+deepgram:
+  sample_rate: 16000
+  channels: 1
+  encoding: linear16
+  model: nova-2-general
+  keepalive: true   # (safe to leave; plugin keeps WS alive internally)
+  language: en-US
+
+
+voices:
+  router:
+    provider: openai
+    model: gpt-4o-mini-tts
+    voice: alloy
+  booking:
+    provider: openai
+    model: gpt-4o-mini-tts
+    voice: verse
+  reschedule:
+    provider: openai
+    model: gpt-4o-mini-tts
+    voice: sage
+  cancel:
+    provider: openai
+    model: gpt-4o-mini-tts
+    voice: breeze
+  parts:
+    provider: openai
+    model: gpt-4o-mini-tts
+    voice: opal
+  status:
+    provider: openai
+    model: gpt-4o-mini-tts
+    voice: pearl
+  pricing:
+    provider: openai
+    model: gpt-4o-mini-tts
+    voice: aria
+  billing:
+    provider: openai
+    model: gpt-4o-mini-tts
+    voice: lyra
+  operator:
+    provider: openai
+    model: gpt-4o-mini-tts
+    voice: nala
