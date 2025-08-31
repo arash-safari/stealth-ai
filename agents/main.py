@@ -105,20 +105,28 @@ OPENAI_LLM_MODEL = _cfg_get(CONFIG, "openai.llm_model", "gpt-4o")
 OPENAI_TTS_MODEL_FROM_CFG = _cfg_get(CONFIG, "openai.tts_model", "gpt-4o-mini-tts")
 OPENAI_DEFAULT_VOICE = _cfg_get(CONFIG, "openai.default_voice", None)  # may be None
 
-# Deepgram audio
-DG_SAMPLE_RATE = int(_cfg_get(CONFIG, "deepgram.sample_rate", 48000))
-DG_CHANNELS = int(_cfg_get(CONFIG, "deepgram.channels", 1))
-DG_ENCODING = _cfg_get(CONFIG, "deepgram.encoding", "linear16")
+# Deepgram config from YAML
 DG_MODEL = _cfg_get(CONFIG, "deepgram.model", "nova-2-general")
-DG_KEEPALIVE = bool(_cfg_get(CONFIG, "deepgram.keepalive", True))
+DG_SAMPLE_RATE = int(_cfg_get(CONFIG, "deepgram.sample_rate", 48000))
+DG_ENCODING = _cfg_get(CONFIG, "deepgram.encoding", "linear16")  # not used by plugin, kept for reference
+DG_CHANNELS = int(_cfg_get(CONFIG, "deepgram.channels", 1))      # not used by plugin, kept for reference
+DG_LANGUAGE = _cfg_get(CONFIG, "deepgram.language", "en-US")
+
+# STT behavior sub-config
+DG_STT_CFG: Dict[str, Any] = _cfg_get(CONFIG, "deepgram.stt", {}) or {}
+DG_INTERIM = bool(DG_STT_CFG.get("interim_results", True))
+DG_NO_DELAY = bool(DG_STT_CFG.get("no_delay", True))
+DG_ENDPOINTING_MS = int(DG_STT_CFG.get("endpointing_ms", 120))
+DG_PUNCTUATE = bool(DG_STT_CFG.get("punctuate", True))
+DG_SMART_FORMAT = bool(DG_STT_CFG.get("smart_format", True))
+DG_FILLER_WORDS = bool(DG_STT_CFG.get("filler_words", False))
+DG_NUMERALS = bool(DG_STT_CFG.get("numerals", False))
 
 logger.info(
-    "Deepgram audio config -> sample_rate=%s, channels=%s, encoding=%s, model=%s, keepalive=%s",
-    DG_SAMPLE_RATE,
-    DG_CHANNELS,
-    DG_ENCODING,
-    DG_MODEL,
-    DG_KEEPALIVE,
+    "Deepgram config -> model=%s, sample_rate=%s, language=%s, "
+    "interim=%s, no_delay=%s, endpointing_ms=%s, punctuate=%s, smart_format=%s, filler_words=%s, numerals=%s",
+    DG_MODEL, DG_SAMPLE_RATE, DG_LANGUAGE,
+    DG_INTERIM, DG_NO_DELAY, DG_ENDPOINTING_MS, DG_PUNCTUATE, DG_SMART_FORMAT, DG_FILLER_WORDS, DG_NUMERALS,
 )
 
 # Voices per agent (provider/model/voice) from config, fallback to prior hardcoded map
@@ -157,35 +165,35 @@ logger.info(
 
 def build_tts(provider: str, model: str, voice: str):
     if provider == "openai":
-        # When using OpenAI TTS, both model and voice are required.
         return openai.TTS(model=model, voice=voice)
     elif provider == "cartesia":
-        # Cartesia uses voice_id; 'model' is unused here but kept for a uniform signature
         return cartesia.TTS(voice_id=voice)
     else:
         raise ValueError(f"Unsupported TTS provider: {provider}")
 
 
 def build_deepgram_stt() -> deepgram.STT:
-    dg_language = _cfg_get(CONFIG, "deepgram.language", "en-US")
-    # Trade-offs:
-    # - punctuate/smart_format OFF -> faster finals, but less pretty text
-    # - no_delay ON -> send partials ASAP
-    # - endpointing_ms smaller -> earlier finalization after pauses
-    # - sample_rate: match your capture to avoid resampling
-    return deepgram.STT(
-        model=DG_MODEL,                 # e.g., "nova-2-general"
-        language=dg_language,           # e.g., "en-US"
-        interim_results=True,           # get partials quickly
-        no_delay=True,                  # flush partials immediately
-        endpointing_ms=80,              # 50–150ms is a good fast range
-        punctuate=False,                # faster finalization
-        smart_format=False,             # faster finalization
-        filler_words=False,             # shave a bit more post-processing
-        numerals=False,                 # keep off unless you need it
-        sample_rate=DG_SAMPLE_RATE,     # match 48000 if your input is 48k
-        api_key=DEEPGRAM_API_KEY,
-    )
+    """
+    Build Deepgram STT using kwargs from config.yaml.
+    The Python plugin accepts these directly; there is no STTOptions class.
+    """
+    kwargs = {
+        "model": DG_MODEL,
+        "language": DG_LANGUAGE,
+        "interim_results": DG_INTERIM,
+        "no_delay": DG_NO_DELAY,
+        "endpointing_ms": DG_ENDPOINTING_MS,
+        "punctuate": DG_PUNCTUATE,
+        "smart_format": DG_SMART_FORMAT,
+        "filler_words": DG_FILLER_WORDS,
+        "numerals": DG_NUMERALS,
+        "sample_rate": DG_SAMPLE_RATE,
+        "api_key": DEEPGRAM_API_KEY,
+    }
+    # Drop any None values just in case
+    kwargs = {k: v for k, v in kwargs.items() if v is not None}
+    return deepgram.STT(**kwargs)
+
 
 # ----------------------------------------------------------------------------
 # Helpers: robust retry with cancel, jitter, and backoff
@@ -245,11 +253,8 @@ async def entrypoint(ctx: JobContext):
     )
 
     stt = build_deepgram_stt()
-
-    # LLM (OpenAI)
     llm = openai.LLM(model=OPENAI_LLM_MODEL)
 
-    # Default session TTS
     session_tts = build_tts(
         provider=DEFAULT_TTS_PROVIDER,
         model=DEFAULT_TTS_MODEL,
