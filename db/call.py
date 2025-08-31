@@ -1,136 +1,104 @@
-"""
-Call handling service (async)
-----------------------------
-Functions:
-  - create_call(user_id: Optional[str], phone: Optional[str], channel='phone', issue_category: Optional[str], notes: Optional[str])
-  - add_call_message(call_id: str, sender: CallSender, content: str)
-  - list_call_messages(call_id: str)
-  - search_calls_by_issue(query: str, limit: int = 50)
-  - close_call(call_id: str)
-
-Depends on models.py (SQLAlchemy async).
-"""
+# db/models.py
 from __future__ import annotations
-
+import os
 import uuid
+from enum import Enum
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Optional
 
-from sqlalchemy import select, or_, text as sql_text
+from sqlalchemy import (
+    Column, String, Text, DateTime, Enum as SAEnum, ForeignKey, JSON, Index
+)
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncAttrs
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from models import Session, Call, CallMessage, CallSender
+# --- Choose DB via env; default to sqlite+aiosqlite to avoid extra deps in tests ---
+DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:///./plumber_calls.db")
 
+# --- Base / Engine / Session ---
+class Base(AsyncAttrs, DeclarativeBase):
+    pass
 
-async def create_call(
-    *,
-    user_id: Optional[str] = None,
-    phone: Optional[str] = None,
-    channel: str = "phone",
-    issue_category: Optional[str] = None,
-    notes: Optional[str] = None,
-):
-    async with Session() as db:
-        c = Call(
-            user_id=uuid.UUID(user_id) if user_id else None,
-            phone=phone,
-            channel=channel,
-            issue_category=issue_category,
-            notes=notes,
-        )
-        db.add(c)
-        await db.commit()
-        await db.refresh(c)
-        return {
-            "id": str(c.id),
-            "user_id": str(c.user_id) if c.user_id else None,
-            "phone": c.phone,
-            "channel": c.channel,
-            "issue_category": c.issue_category,
-            "started_at": c.started_at,
-        }
+engine = create_async_engine(DB_URL, future=True)
+Session = async_sessionmaker(engine, expire_on_commit=False)
 
+# --- Enums ---
+class CallSender(str, Enum):
+    user = "user"
+    agent = "agent"
+    system = "system"
 
-async def add_call_message(*, call_id: str, sender: str, content: str):
-    if sender not in (CallSender.user, CallSender.agent, CallSender.system):
-        raise ValueError("sender must be 'user' | 'agent' | 'system'")
-    async with Session() as db:
-        m = CallMessage(call_id=uuid.UUID(call_id), sender=sender, content=content)
-        db.add(m)
-        await db.commit()
-        await db.refresh(m)
-        return {"id": str(m.id), "call_id": call_id, "sender": m.sender, "content": m.content, "created_at": m.created_at}
+# --- Models ---
+def _uuid_pk() -> uuid.UUID:
+    return uuid.uuid4()
 
+class Call(Base):
+    __tablename__ = "calls"
 
-async def list_call_messages(call_id: str) -> List[dict]:
-    async with Session() as db:
-        rows = (
-            await db.execute(
-                select(CallMessage).where(CallMessage.call_id == uuid.UUID(call_id)).order_by(CallMessage.created_at.asc())
-            )
-        ).scalars().all()
-        return [
-            {
-                "id": str(m.id),
-                "sender": m.sender,
-                "content": m.content,
-                "created_at": m.created_at,
-            }
-            for m in rows
-        ]
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True) if DB_URL.startswith("postgresql") else String(36),
+        primary_key=True,
+        default=_uuid_pk,
+    )
+    # core identifiers
+    user_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    phone: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    channel: Mapped[str] = mapped_column(String(16), default="phone")
 
+    # categorization / notes
+    issue_category: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-async def search_calls_by_issue(query: str, limit: int = 50) -> List[dict]:
-    """Find calls with issue_category matching query OR message content matching query (ILIKE)."""
-    q = f"%{query}%"
-    async with Session() as db:
-        calls = (
-            await db.execute(
-                select(Call).where(Call.issue_category.ilike(q)).order_by(Call.started_at.desc()).limit(limit)
-            )
-        ).scalars().all()
-        if len(calls) < limit:
-            # supplement with message-content search for calls not already included
-            call_ids = {c.id for c in calls}
-            msg_calls = (
-                await db.execute(
-                    sql_text(
-                        """
-                        SELECT DISTINCT c.*
-                        FROM call_messages cm
-                        JOIN calls c ON c.id = cm.call_id
-                        WHERE cm.content ILIKE :q
-                        ORDER BY c.started_at DESC
-                        LIMIT :lim
-                        """
-                    ),
-                    {"q": q, "lim": limit},
-                )
-            ).all()
-            for row in msg_calls:
-                c = row[0]
-                if c.id not in call_ids:
-                    calls.append(c)
-                if len(calls) >= limit:
-                    break
-        return [
-            {
-                "id": str(c.id),
-                "user_id": str(c.user_id) if c.user_id else None,
-                "phone": c.phone,
-                "channel": c.channel,
-                "issue_category": c.issue_category,
-                "started_at": c.started_at,
-                "ended_at": c.ended_at,
-            }
-            for c in calls
-        ]
+    # artifacts
+    audio_path: Mapped[Optional[str]] = mapped_column(Text, nullable=True)   # single agent wav
+    bundle_path: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # call.json path
 
+    # snapshots
+    config_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    instructions_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    meta_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    stats_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
-async def close_call(call_id: str):
-    async with Session() as db:
-        c = await db.get(Call, uuid.UUID(call_id))
-        if not c:
-            raise RuntimeError("Call not found")
-        c.ended_at = datetime.now(timezone.utc)
-        await db.commit()
-        return {"ok": True}
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    messages: Mapped[list["CallMessage"]] = relationship(
+        back_populates="call",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="CallMessage.created_at.asc()",
+    )
+
+    __table_args__ = (
+        Index("ix_calls_issue_category", "issue_category"),
+        Index("ix_calls_started_at", "started_at"),
+    )
+
+class CallMessage(Base):
+    __tablename__ = "call_messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True) if DB_URL.startswith("postgresql") else String(36),
+        primary_key=True,
+        default=_uuid_pk,
+    )
+    call_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True) if DB_URL.startswith("postgresql") else String(36),
+        ForeignKey("calls.id", ondelete="CASCADE"),
+    )
+    sender: Mapped[CallSender] = mapped_column(SAEnum(CallSender), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    call: Mapped["Call"] = relationship(back_populates="messages")
+
+    __table_args__ = (
+        Index("ix_call_messages_call_id_created_at", "call_id", "created_at"),
+        Index("ix_call_messages_content_gist", "content"),  # harmless in SQLite, useful in PG if you switch to FTS
+    )
+
+# --- helper: init DB (create tables) ---
+async def init_db() -> None:
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
