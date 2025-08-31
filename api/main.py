@@ -1,37 +1,49 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date, time, datetime, timedelta, timezone
-from typing import List, Optional, Literal
-
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field, EmailStr
-from zoneinfo import ZoneInfo
-from sqlalchemy import select, update, delete, insert
-from sqlalchemy.exc import IntegrityError
-from contextlib import asynccontextmanager
 import os
-from dotenv import load_dotenv
-from typing import Literal  # already present
+from contextlib import asynccontextmanager
+from datetime import date, time, datetime, timedelta, timezone
+from typing import List, Optional, Literal, Dict
 
-# --- Your project imports ---
-from db.models import (
-    Session,
-    Tech, Skill, TechSkill, TechShift, Appointment, User, Address,
-    AppointmentStatus, RequestPriority,
-)
-# Scheduling core
-from services.schedule_service import (
-    get_available_times, hold_slot, create_meeting,
-    read_meeting, update_meeting, cancel_meeting,
-    create_earliest_meeting,
-)
-# Load env before importing models/engine
+from fastapi import FastAPI, HTTPException, Query, Body, Response
+from pydantic import BaseModel, Field, EmailStr, field_validator
+from zoneinfo import ZoneInfo
+from sqlalchemy import select, delete
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from dotenv import load_dotenv
+
+# --- Load env before importing models/engine ---
 for name in (".env.local", "env.local", ".env"):
     if os.path.exists(name):
         load_dotenv(name, override=False)
 
-from db.models import init_db, engine  # noqa: E402
+# --- Project imports ---
+from db.session import Session  # async session factory
+from db.models import (
+    Tech,
+    Skill,
+    TechSkill,
+    TechShift,
+    Appointment,
+    User,
+    Address,
+    AppointmentStatus,
+    RequestPriority,
+    init_db,
+    engine,
+)
+from services.schedule_service import (
+    get_available_times,
+    hold_slot,
+    create_meeting,
+    read_meeting,
+    update_meeting,
+    cancel_meeting,
+    create_earliest_meeting,
+)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -42,7 +54,11 @@ async def lifespan(app: FastAPI):
     await engine.dispose()
 
 
-app = FastAPI(lifespan=lifespan, title="Plumber Contact Center API", version="0.1.0")
+app = FastAPI(
+    lifespan=lifespan,
+    title="Plumber Contact Center API",
+    version="0.2.0",
+)
 
 
 # ---------------------------
@@ -78,16 +94,16 @@ class TechAvailabilityCreate(BaseModel):
         description="If true, delete overlapping shifts before inserting.",
     )
 
-
-class AvailabilityQuery(BaseModel):
-    skill: str
-    duration_min: int = 120
-    priority: RequestPriority = RequestPriority.P3
-    date_from: Optional[datetime] = None
-    date_to: Optional[datetime] = None
-    limit: int = 20
-    postal_code: Optional[str] = None
-    respect_google_busy: bool = True
+    @field_validator("weekdays")
+    @classmethod
+    def _validate_weekdays(cls, v: Optional[List[int]]):
+        if v is None:
+            return v
+        bad = [x for x in v if not isinstance(x, int) or x < 0 or x > 6]
+        if bad:
+            raise ValueError("weekdays values must be integers in 0..6")
+        # de-dup to avoid inserting same day twice
+        return sorted(set(v))
 
 
 class SlotOut(BaseModel):
@@ -103,8 +119,16 @@ class AppointmentCreate(BaseModel):
     skill: Optional[str] = None
     start: Optional[datetime] = None
     end: Optional[datetime] = None
+    duration_min: int = 120  # used when booking earliest by skill
     priority: RequestPriority = RequestPriority.P3
     request_text: Optional[str] = None
+
+    @field_validator("start", "end")
+    @classmethod
+    def _tz_required(cls, v: Optional[datetime]):
+        if v is not None and v.tzinfo is None:
+            raise ValueError("datetime fields must include a timezone offset")
+        return v
 
 
 class AppointmentPatch(BaseModel):
@@ -113,10 +137,17 @@ class AppointmentPatch(BaseModel):
     status: Optional[AppointmentStatus] = None
     request_text: Optional[str] = None
 
+    @field_validator("start", "end")
+    @classmethod
+    def _tz_required(cls, v: Optional[datetime]):
+        if v is not None and v.tzinfo is None:
+            raise ValueError("datetime fields must include a timezone offset")
+        return v
+
 
 class AppointmentOut(BaseModel):
     id: str
-    appointment_no: int                           # ← include user-facing number
+    appointment_no: Optional[int] = None  # may be null for legacy rows
     user_id: str
     tech_id: str
     start: datetime
@@ -136,18 +167,27 @@ class HoldCreate(BaseModel):
     request_text: Optional[str] = None
     show_tentative_on_google: bool = False
 
+    @field_validator("start", "end")
+    @classmethod
+    def _tz_required(cls, v: Optional[datetime]):
+        if v is not None and v.tzinfo is None:
+            raise ValueError("datetime fields must include a timezone offset")
+        return v
+
+
+class HoldOut(BaseModel):
+    id: str
+    tech_id: str
+    start: datetime
+    end: datetime
+    expires_at: datetime
+
 
 class UserCreate(BaseModel):
     full_name: str
     phone: str
     email: Optional[EmailStr] = None
 
-
-class UserOut(BaseModel):
-    id: str
-    full_name: str
-    phone: str
-    email: Optional[str] = None
 
 class AddressOut(BaseModel):
     id: str
@@ -169,6 +209,7 @@ class UserOut(BaseModel):
     email: Optional[str] = None
     addresses: List[AddressOut] = Field(default_factory=list)
 
+
 # ---------------------------
 # Helpers
 # ---------------------------
@@ -179,7 +220,9 @@ async def _ensure_skill_ids(db: Session, names: List[str]) -> List[uuid.UUID]:
         n_norm = n.strip()
         if not n_norm:
             continue
-        row = (await db.execute(select(Skill).where(Skill.name.ilike(n_norm)))).scalar_one_or_none()
+        row = (
+            await db.execute(select(Skill).where(Skill.name.ilike(n_norm)))
+        ).scalar_one_or_none()
         if row:
             out.append(row.id)
         else:
@@ -216,10 +259,27 @@ def _local_range_to_utc(d: date, start_t: time, end_t: time, tz: str) -> tuple[d
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
 
+def _require_tz(dt: Optional[datetime], name: str):
+    if dt is not None and dt.tzinfo is None:
+        raise HTTPException(400, f"{name} must include a timezone offset")
+
+
+def _parse_uuid(value: str, field: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(value)
+    except Exception:
+        raise HTTPException(400, f"{field} must be a UUID")
+
+
 # ---------------------------
 # Techs
 # ---------------------------
-@app.post("/techs", response_model=TechOut, status_code=201)
+@app.post(
+    "/techs",
+    response_model=TechOut,
+    status_code=201,
+    response_model_exclude_none=True,
+)
 async def create_tech(payload: TechCreate):
     async with Session() as db:
         t = Tech(
@@ -233,36 +293,45 @@ async def create_tech(payload: TechCreate):
         await db.flush()
         # skills
         ids = await _ensure_skill_ids(db, payload.skills)
-        for sid in ids:
-            db.add(TechSkill(tech_id=t.id, skill_id=sid))
+        if ids:
+            stmt = pg_insert(TechSkill).values(
+                [{"tech_id": t.id, "skill_id": sid} for sid in ids]
+            ).on_conflict_do_nothing(index_elements=["tech_id", "skill_id"])
+            await db.execute(stmt)
         await db.commit()
         await db.refresh(t)
         return await _tech_to_out(db, t)
 
 
-@app.get("/techs/{tech_id}", response_model=TechOut)
+@app.get(
+    "/techs/{tech_id}",
+    response_model=TechOut,
+    response_model_exclude_none=True,
+)
 async def get_tech(tech_id: str):
     async with Session() as db:
-        t = await db.get(Tech, uuid.UUID(tech_id))
+        t = await db.get(Tech, _parse_uuid(tech_id, "tech_id"))
         if not t:
             raise HTTPException(404, "Tech not found")
         return await _tech_to_out(db, t)
 
 
-@app.post("/techs/{tech_id}/skills", response_model=TechOut)
-async def add_skills(tech_id: str, skills: List[str]):
+@app.post(
+    "/techs/{tech_id}/skills",
+    response_model=TechOut,
+    response_model_exclude_none=True,
+)
+async def add_skills(tech_id: str, skills: List[str] = Body(...)):
     async with Session() as db:
-        t = await db.get(Tech, uuid.UUID(tech_id))
+        t = await db.get(Tech, _parse_uuid(tech_id, "tech_id"))
         if not t:
             raise HTTPException(404, "Tech not found")
         ids = await _ensure_skill_ids(db, skills)
-        for sid in ids:
-            # upsert-like: ignore duplicates thanks to PK on (tech_id, skill_id)
-            try:
-                db.add(TechSkill(tech_id=t.id, skill_id=sid))
-                await db.flush()
-            except IntegrityError:
-                await db.rollback()
+        if ids:
+            stmt = pg_insert(TechSkill).values(
+                [{"tech_id": t.id, "skill_id": sid} for sid in ids]
+            ).on_conflict_do_nothing(index_elements=["tech_id", "skill_id"])
+            await db.execute(stmt)
         await db.commit()
         return await _tech_to_out(db, t)
 
@@ -270,14 +339,18 @@ async def add_skills(tech_id: str, skills: List[str]):
 # ---------------------------
 # Availability (TechShift)
 # ---------------------------
-@app.post("/techs/{tech_id}/availability", status_code=201)
+@app.post(
+    "/techs/{tech_id}/availability",
+    status_code=201,
+    response_model_exclude_none=True,
+)
 async def publish_availability(tech_id: str, body: TechAvailabilityCreate):
     """
     Creates TechShift rows for each matching day in the range.
     Times are interpreted in the tech's timezone, stored UTC.
     """
     async with Session() as db:
-        t = await db.get(Tech, uuid.UUID(tech_id))
+        t = await db.get(Tech, _parse_uuid(tech_id, "tech_id"))
         if not t:
             raise HTTPException(404, "Tech not found")
 
@@ -291,7 +364,9 @@ async def publish_availability(tech_id: str, body: TechAvailabilityCreate):
         created = 0
         while cur <= body.end_date:
             if body.weekdays is None or cur.weekday() in body.weekdays:
-                start_utc, end_utc = _local_range_to_utc(cur, body.start_time, body.end_time, t.timezone)
+                start_utc, end_utc = _local_range_to_utc(
+                    cur, body.start_time, body.end_time, t.timezone
+                )
 
                 if body.clear_overlaps:
                     await db.execute(
@@ -302,8 +377,7 @@ async def publish_availability(tech_id: str, body: TechAvailabilityCreate):
                         )
                     )
 
-                ts = TechShift(tech_id=t.id, start_ts=start_utc, end_ts=end_utc)
-                db.add(ts)
+                db.add(TechShift(tech_id=t.id, start_ts=start_utc, end_ts=end_utc))
                 created += 1
             cur = cur + timedelta(days=1)
 
@@ -314,7 +388,11 @@ async def publish_availability(tech_id: str, body: TechAvailabilityCreate):
 # ---------------------------
 # Availability query (scheduler)
 # ---------------------------
-@app.get("/availability", response_model=List[SlotOut])
+@app.get(
+    "/availability",
+    response_model=List[SlotOut],
+    response_model_exclude_none=True,
+)
 async def availability(
     skill: str = Query(..., description="Skill name"),
     duration_min: int = 120,
@@ -325,6 +403,9 @@ async def availability(
     postal_code: Optional[str] = None,
     respect_google_busy: bool = True,
 ):
+    _require_tz(date_from, "date_from")
+    _require_tz(date_to, "date_to")
+
     slots = await get_available_times(
         skill=skill,
         duration_min=duration_min,
@@ -341,7 +422,12 @@ async def availability(
 # ---------------------------
 # Appointments
 # ---------------------------
-@app.post("/appointments", response_model=AppointmentOut, status_code=201)
+@app.post(
+    "/appointments",
+    response_model=AppointmentOut,
+    status_code=201,
+    response_model_exclude_none=True,
+)
 async def create_appt(body: AppointmentCreate):
     """
     Create an appointment with explicit tech+time or by skill (earliest).
@@ -356,18 +442,18 @@ async def create_appt(body: AppointmentCreate):
             priority=body.priority,
             request_text=body.request_text,
         )
-        full = await read_meeting(created["id"])   # ← ensure appointment_no is included
+        full = await read_meeting(created["id"])  # ensure appointment_no is included
         return AppointmentOut(**full)
 
     if body.skill and not (body.start or body.end or body.tech_id):
         created = await create_earliest_meeting(
             user_id=body.user_id,
             skill=body.skill,
-            duration_min=120,
+            duration_min=body.duration_min,
             priority=body.priority,
             request_text=body.request_text,
         )
-        full = await read_meeting(created["id"])   # ← ensure appointment_no is included
+        full = await read_meeting(created["id"])  # ensure appointment_no is included
         return AppointmentOut(**full)
 
     raise HTTPException(
@@ -376,13 +462,21 @@ async def create_appt(body: AppointmentCreate):
     )
 
 
-@app.get("/appointments/{appointment_id}", response_model=AppointmentOut)
+@app.get(
+    "/appointments/{appointment_id}",
+    response_model=AppointmentOut,
+    response_model_exclude_none=True,
+)
 async def get_appt(appointment_id: str):
-    appt = await read_meeting(appointment_id)      # already returns appointment_no
+    appt = await read_meeting(appointment_id)  # already returns appointment_no
     return AppointmentOut(**appt)
 
 
-@app.patch("/appointments/{appointment_id}", response_model=AppointmentOut)
+@app.patch(
+    "/appointments/{appointment_id}",
+    response_model=AppointmentOut,
+    response_model_exclude_none=True,
+)
 async def patch_appt(appointment_id: str, body: AppointmentPatch):
     await update_meeting(
         appointment_no=appointment_id,
@@ -391,49 +485,55 @@ async def patch_appt(appointment_id: str, body: AppointmentPatch):
         status=body.status,
         request_text=body.request_text,
     )
-    full = await read_meeting(appointment_id)      # return full row (with appointment_no)
+    full = await read_meeting(appointment_id)  # return full row (with appointment_no)
     return AppointmentOut(**full)
 
 
-@app.delete("/appointments/{appointment_id}")
+@app.delete("/appointments/{appointment_id}", status_code=204)
 async def delete_appt(appointment_id: str):
     await cancel_meeting(appointment_id)
-    return {"ok": True}
+    return Response(status_code=204)
 
 
-@app.get("/users/{user_id}/appointments", response_model=List[AppointmentOut])
+@app.get(
+    "/users/{user_id}/appointments",
+    response_model=List[AppointmentOut],
+    response_model_exclude_none=True,
+)
 async def user_appts(user_id: str):
     async with Session() as db:
         rows = (
             await db.execute(
                 select(Appointment)
-                .where(Appointment.user_id == uuid.UUID(user_id))
+                .where(Appointment.user_id == _parse_uuid(user_id, "user_id"))
                 .order_by(Appointment.start_ts.desc())
             )
         ).scalars().all()
-        out: List[AppointmentOut] = []
-        for a in rows:
-            out.append(
-                AppointmentOut(
-                    id=str(a.id),
-                    appointment_no=a.appointment_no,         # ← include number
-                    user_id=str(a.user_id),
-                    tech_id=str(a.tech_id),
-                    start=a.start_ts,
-                    end=a.end_ts,
-                    priority=a.priority,
-                    status=a.status,
-                    google_event_id=a.google_event_id,
-                    hangout_link=a.hangout_link,
-                )
+        return [
+            AppointmentOut(
+                id=str(a.id),
+                appointment_no=a.appointment_no,
+                user_id=str(a.user_id),
+                tech_id=str(a.tech_id),
+                start=a.start_ts,
+                end=a.end_ts,
+                priority=a.priority,
+                status=a.status,
+                google_event_id=a.google_event_id,
+                hangout_link=a.hangout_link,
             )
-        return out
+            for a in rows
+        ]
 
 
 # ---------------------------
 # Holds (temporary reservations)
 # ---------------------------
-@app.post("/holds")
+@app.post(
+    "/holds",
+    response_model=HoldOut,
+    response_model_exclude_none=True,
+)
 async def create_hold(body: HoldCreate):
     try:
         h = await hold_slot(
@@ -445,18 +545,27 @@ async def create_hold(body: HoldCreate):
             request_text=body.request_text,
             show_tentative_on_google=body.show_tentative_on_google,
         )
-        return h
+        return HoldOut(**h)
     except RuntimeError as e:
         raise HTTPException(409, str(e)) from e
 
 
 # ---------------------------
-# Minimal Users (optional helpers)
+# Users
 # ---------------------------
-@app.post("/users", response_model=UserOut, status_code=201)
-async def create_user(full_name: str, phone: str, email: Optional[EmailStr] = None):
+@app.post(
+    "/users",
+    response_model=UserOut,
+    status_code=201,
+    response_model_exclude_none=True,
+)
+async def create_user(payload: UserCreate = Body(...)):
     async with Session() as db:
-        u = User(full_name=full_name.strip(), phone=phone.strip(), email=(email.lower() if email else None))
+        u = User(
+            full_name=payload.full_name.strip(),
+            phone=payload.phone.strip(),
+            email=(payload.email.lower() if payload.email else None),
+        )
         db.add(u)
         try:
             await db.commit()
@@ -467,10 +576,14 @@ async def create_user(full_name: str, phone: str, email: Optional[EmailStr] = No
         return UserOut(id=str(u.id), full_name=u.full_name, phone=u.phone, email=u.email)
 
 
-@app.get("/users/{user_id}", response_model=UserOut)
+@app.get(
+    "/users/{user_id}",
+    response_model=UserOut,
+    response_model_exclude_none=True,
+)
 async def get_user(user_id: str):
     async with Session() as db:
-        u = await db.get(User, uuid.UUID(user_id))
+        u = await db.get(User, _parse_uuid(user_id, "user_id"))
         if not u:
             raise HTTPException(404, "User not found")
 
@@ -507,11 +620,15 @@ async def get_user(user_id: str):
         )
 
 
-@app.get("/appointments", response_model=List[AppointmentOut])
+@app.get(
+    "/appointments",
+    response_model=List[AppointmentOut],
+    response_model_exclude_none=True,
+)
 async def list_appointments(
     user_id: Optional[str] = None,
     tech_id: Optional[str] = None,
-    status: Optional[AppointmentStatus] = None,   # e.g. scheduled|en_route|complete|canceled
+    status: Optional[AppointmentStatus] = None,  # e.g. scheduled|en_route|complete|canceled
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
     include_canceled: bool = False,
@@ -526,21 +643,17 @@ async def list_appointments(
       - if date_from is set: end_ts > date_from
       - if date_to   is set: start_ts < date_to
     """
+    _require_tz(date_from, "date_from")
+    _require_tz(date_to, "date_to")
+
     async with Session() as db:
         stmt = select(Appointment)
 
         # Optional filters
         if user_id:
-            try:
-                stmt = stmt.where(Appointment.user_id == uuid.UUID(user_id))
-            except Exception:
-                raise HTTPException(400, "user_id must be a UUID")
-
+            stmt = stmt.where(Appointment.user_id == _parse_uuid(user_id, "user_id"))
         if tech_id:
-            try:
-                stmt = stmt.where(Appointment.tech_id == uuid.UUID(tech_id))
-            except Exception:
-                raise HTTPException(400, "tech_id must be a UUID")
+            stmt = stmt.where(Appointment.tech_id == _parse_uuid(tech_id, "tech_id"))
 
         if status is not None:
             stmt = stmt.where(Appointment.status == status)
@@ -553,7 +666,9 @@ async def list_appointments(
             stmt = stmt.where(Appointment.start_ts < date_to)
 
         # Sort + paginate
-        stmt = stmt.order_by(Appointment.start_ts.desc() if order == "desc" else Appointment.start_ts.asc())
+        stmt = stmt.order_by(
+            Appointment.start_ts.desc() if order == "desc" else Appointment.start_ts.asc()
+        )
         if offset:
             stmt = stmt.offset(offset)
         if limit:
@@ -564,7 +679,7 @@ async def list_appointments(
         return [
             AppointmentOut(
                 id=str(a.id),
-                appointment_no=a.appointment_no,           # ← include number
+                appointment_no=a.appointment_no,
                 user_id=str(a.user_id),
                 tech_id=str(a.tech_id),
                 start=a.start_ts,
@@ -578,74 +693,11 @@ async def list_appointments(
         ]
 
 
-# (Your file had a duplicate /appointments route; keeping it in sync just in case)
-@app.get("/appointments", response_model=List[AppointmentOut])
-async def list_appointments(
-    user_id: Optional[str] = None,
-    tech_id: Optional[str] = None,
-    status: Optional[AppointmentStatus] = None,   # e.g. scheduled|en_route|complete|canceled
-    date_from: Optional[datetime] = None,
-    date_to: Optional[datetime] = None,
-    include_canceled: bool = False,
-    limit: int = Query(100, ge=1, le=500),
-    offset: int = Query(0, ge=0),
-    order: Literal["asc", "desc"] = "asc",
-):
-    async with Session() as db:
-        stmt = select(Appointment)
-
-        if user_id:
-            try:
-                stmt = stmt.where(Appointment.user_id == uuid.UUID(user_id))
-            except Exception:
-                raise HTTPException(400, "user_id must be a UUID")
-
-        if tech_id:
-            try:
-                stmt = stmt.where(Appointment.tech_id == uuid.UUID(tech_id))
-            except Exception:
-                raise HTTPException(400, "tech_id must be a UUID")
-
-        if status is not None:
-            stmt = stmt.where(Appointment.status == status)
-        elif not include_canceled:
-            stmt = stmt.where(Appointment.status != AppointmentStatus.canceled)
-
-        if date_from is not None:
-            stmt = stmt.where(Appointment.end_ts > date_from)
-        if date_to is not None:
-            stmt = stmt.where(Appointment.start_ts < date_to)
-
-        stmt = stmt.order_by(Appointment.start_ts.desc() if order == "desc" else Appointment.start_ts.asc())
-        if offset:
-            stmt = stmt.offset(offset)
-        if limit:
-            stmt = stmt.limit(limit)
-
-        rows = (await db.execute(stmt)).scalars().all()
-
-        out: List[AppointmentOut] = [
-            AppointmentOut(
-                id=str(a.id),
-                appointment_no=a.appointment_no,           # ← include number
-                user_id=str(a.user_id),
-                tech_id=str(a.tech_id),
-                start=a.start_ts,
-                end=a.end_ts,
-                priority=a.priority,
-                status=a.status,
-                google_event_id=a.google_event_id,
-                hangout_link=a.hangout_link,
-            )
-            for a in rows
-        ]
-        return out
-
-
-# ---------------------------
-# Holds (temporary reservations)
-# ---------------------------
-@app.get("/users", response_model=List[UserOut])
+@app.get(
+    "/users",
+    response_model=List[UserOut],
+    response_model_exclude_none=True,
+)
 async def list_users(
     q: Optional[str] = Query(None, description="Case-insensitive search in name/phone/email"),
     limit: int = Query(100, ge=1, le=500),
@@ -658,9 +710,9 @@ async def list_users(
         if q:
             like = f"%{q.strip()}%"
             stmt = stmt.where(
-                (User.full_name.ilike(like)) |
-                (User.phone.ilike(like)) |
-                (User.email.ilike(like))
+                (User.full_name.ilike(like))
+                | (User.phone.ilike(like))
+                | (User.email.ilike(like))
             )
 
         stmt = stmt.order_by(User.full_name.asc() if order == "asc" else User.full_name.desc())
@@ -685,7 +737,7 @@ async def list_users(
         ).scalars().all()
 
         # group addresses by user_id
-        addr_map: dict[uuid.UUID, List[AddressOut]] = {}
+        addr_map: Dict[uuid.UUID, List[AddressOut]] = {}
         for a in addr_rows:
             addr_map.setdefault(a.user_id, []).append(
                 AddressOut(

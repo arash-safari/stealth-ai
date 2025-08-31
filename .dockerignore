@@ -1,13 +1,9 @@
-.pgdata
-.venv
-.env
-.env.local
-__pycache__/
-*.pyc
-.git
-.gitignore
-dist
-build
-.coverage
-pytest_cache
-.pgdata
+!Dockerfile
+!livekit.toml
+!pyproject.toml
+!requirements.txt
+!uv.lock
+
+# your agent code (adjust to your repo)
+!agents/**
+!src/**

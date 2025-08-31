@@ -22,11 +22,10 @@ from typing import Dict, List, Optional, Tuple, TypedDict
 import re
 
 from zoneinfo import ZoneInfo
-from sqlalchemy import select, text as sql_text, delete, update
+from sqlalchemy import select, text as sql_text, delete, update, cast, String
 from sqlalchemy.ext.asyncio import AsyncSession  # <-- added
-
+from db.session import Session
 from db.models import (
-    Session,
     Skill,
     TechShift,
     Appointment,
@@ -113,6 +112,11 @@ async def get_available_times(
     respect_google_busy: bool = True,
 ) -> List[SlotSuggestion]:
     """Compute availability by skill + duration, subtracting DB holds/appointments and (optionally) Google FreeBusy."""
+    from sqlalchemy import cast, String  # local import to avoid forgetting it at module top
+
+    if duration_min <= 0 or limit <= 0:
+        return []
+
     now = datetime.now(timezone.utc)
     start_h = date_from or now
 
@@ -160,16 +164,18 @@ async def get_available_times(
             return []
 
         # Busy blocks from DB: appointments (not canceled) + holds (not expired)
+        # IMPORTANT: cast enum to text to avoid asyncpg enum OID cache issues in prepared statements.
         appts = (
             await db.execute(
                 select(Appointment.start_ts, Appointment.end_ts, Appointment.tech_id).where(
                     Appointment.tech_id.in_(tech_ids),
-                    Appointment.status != AppointmentStatus.canceled,
+                    cast(Appointment.status, String) != "canceled",
                     Appointment.end_ts > start_h,
                     Appointment.start_ts < end_h,
                 )
             )
         ).all()
+
         holds = (
             await db.execute(
                 select(Hold.start_ts, Hold.end_ts, Hold.tech_id).where(
@@ -206,11 +212,14 @@ async def get_available_times(
             t_shifts = [sh for sh in shifts if sh.tech_id == tid]
             if not t_shifts:
                 continue
+
             base_intervals = [Interval(max(sh.start_ts, start_h), min(sh.end_ts, end_h)) for sh in t_shifts]
             blocks = busy_by_tech.get(tid, [])
             free: List[Interval] = []
             for base in base_intervals:
                 free.extend(_subtract(base, blocks))
+
+            # Generate slots
             slots = _split_into_slots(sorted(free, key=lambda x: x.start), duration, max(0, limit - len(results)))
             for s in slots:
                 results.append(
@@ -226,9 +235,8 @@ async def get_available_times(
             if len(results) >= limit:
                 break
 
-        results.sort(key=lambda r: r["start"])  # type: ignore
+        results.sort(key=lambda r: r["start"])  # type: ignore[arg-type]
         return results
-
 
 async def _freebusy(cal_ids: List[str], start_h: datetime, end_h: datetime):
     # Wrapper to ease testing/mocking

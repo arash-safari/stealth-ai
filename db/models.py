@@ -3,8 +3,9 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Dict, Any
 from enum import Enum as PyEnum
+import ssl
 
 from sqlalchemy import (
     Text,
@@ -13,37 +14,36 @@ from sqlalchemy import (
     UniqueConstraint,
     Boolean,
     Index,
-    BigInteger
+    BigInteger,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy import DateTime as SADateTime
 from sqlalchemy.schema import Identity
+from sqlalchemy.engine.url import make_url, URL
+import ssl
 
-# ---------- DB Setup ----------
-import os
-from sqlalchemy.ext.asyncio import create_async_engine
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+asyncpg://plumber:plumber@127.0.0.1:55432/plumbing?ssl=false",
-)
-
-# Force no-SSL if someone forgets the URL param
-connect_args = {}
-if DATABASE_URL.startswith("postgresql+asyncpg://"):
-    connect_args["ssl"] = False
+DATABASE_URL = os.getenv("DATABASE_URL")  # must include sslmode=require
+    
+# (Optional) harden against bad env like PGSSLMODE="true"
+for var in ("PGSSLMODE", "PGSSLNEGOTIATION"):
+    val = os.environ.get(var)
+    if val and val.lower() not in ("disable","allow","prefer","require","verify-ca","verify-full"):
+        os.environ.pop(var, None)
 
 engine = create_async_engine(
     DATABASE_URL,
-    echo=False,
     pool_pre_ping=True,
-    connect_args=connect_args,
+    echo=bool(os.getenv("SQL_ECHO")),
+    connect_args={
+        "ssl": "require"
+    }
 )
-Session: async_sessionmaker[AsyncSession] = async_sessionmaker(
-    engine, expire_on_commit=False, class_=AsyncSession
-)
+
+
+Session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 class Base(DeclarativeBase):
     pass

@@ -11,3 +11,10 @@ KMS
 .pytest_cache
 .ruff_cache
 /stealth-plumber-test/
+asyncio
+hashlib
+logging
+os
+yaml
+data/calls/
+cloud.secrets.env

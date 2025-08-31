@@ -48,36 +48,36 @@ class Booking(BaseAgent):
             tts=openai.TTS(model="gpt-4o-mini-tts", voice="ash"),
         )
 
-    def _generate_windows(self, preferred_date: str | None) -> list[dict]:
-        start_date = datetime.utcnow().date()
-        if preferred_date:
-            try:
-                start_date = datetime.strptime(preferred_date, "%Y-%m-%d").date()
-            except Exception:
-                pass
-        windows = []
-        day_cursor = start_date
-        collected_days = 0
-        while collected_days < 30:
-            if day_cursor.weekday() < 5:
-                for h in [9, 11, 13, 15]:
-                    start_dt = datetime.combine(day_cursor, time(hour=h))
-                    end_dt = start_dt + timedelta(hours=2)
-                    if start_dt >= datetime.utcnow():
-                        windows.append({
-                            "date": day_cursor.isoformat(),
-                            "window": f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}",
-                        })
-                collected_days += 1
-            day_cursor += timedelta(days=1)
-        return windows
+    # def _generate_windows(self, preferred_date: str | None) -> list[dict]:
+    #     start_date = datetime.utcnow().date()
+    #     if preferred_date:
+    #         try:
+    #             start_date = datetime.strptime(preferred_date, "%Y-%m-%d").date()
+    #         except Exception:
+    #             pass
+    #     windows = []
+    #     day_cursor = start_date
+    #     collected_days = 0
+    #     while collected_days < 30:
+    #         if day_cursor.weekday() < 5:
+    #             for h in [9, 11, 13, 15]:
+    #                 start_dt = datetime.combine(day_cursor, time(hour=h))
+    #                 end_dt = start_dt + timedelta(hours=2)
+    #                 if start_dt >= datetime.utcnow():
+    #                     windows.append({
+    #                         "date": day_cursor.isoformat(),
+    #                         "window": f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}",
+    #                     })
+    #             collected_days += 1
+    #         day_cursor += timedelta(days=1)
+    #     return windows
 
-    @function_tool()
-    async def choose_window(self, context: RunContext, date: str, window: str) -> str:
-        u = context.userdata
-        u.appointment_date = date
-        u.appointment_window = window
-        return f"Selected window: {date} {window}"
+    # @function_tool()
+    # async def choose_window(self, context: RunContext, date: str, window: str) -> str:
+    #     u = context.userdata
+    #     u.appointment_date = date
+    #     u.appointment_window = window
+    #     return f"Selected window: {date} {window}"
 
     @function_tool()
     async def confirm_appointment(self, context: RunContext):
