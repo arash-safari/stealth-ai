@@ -1,19 +1,20 @@
 # main.py
 import os
-import hashlib
 import asyncio
 import logging
-from pathlib import Path
 from typing import Optional, Callable, Awaitable, Dict, Any
 from contextlib import suppress
 
-import yaml
 from dotenv import load_dotenv
 from livekit.agents import JobContext, WorkerOptions, cli
 from livekit.agents.voice import AgentSession
-from livekit.plugins import deepgram, openai, cartesia, silero
+from livekit.plugins import openai, silero
 
 from common.models import UserData
+from common.voice_factory import build_tts_for
+from common.config_loader import load_config, cfg_get, mask_key
+from common.stt_factory import build_deepgram_stt
+
 from agents.router import Router
 from agents.booking import Booking
 from agents.reschedule import Reschedule
@@ -29,41 +30,6 @@ from common.logging_config import configure_logging
 
 
 # ----------------------------------------------------------------------------
-# Config loading
-# ----------------------------------------------------------------------------
-
-def _load_config() -> Dict[str, Any]:
-    """
-    Load YAML configuration from CONFIG_PATH (env) or ./config.yaml.
-    Returns an empty dict if the file doesn't exist or can't be parsed.
-    """
-    config_path = Path(os.getenv("CONFIG_PATH", "config.yaml"))
-    if not config_path.exists():
-        logger = logging.getLogger("plumber-contact-center")
-        logger.warning("Config file not found at %s. Using built-in defaults.", config_path)
-        return {}
-    try:
-        with config_path.open("r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    except Exception as e:  # noqa: BLE001
-        logger = logging.getLogger("plumber-contact-center")
-        logger.error("Failed to parse %s: %s. Using built-in defaults.", config_path, e)
-        return {}
-
-
-def _cfg_get(d: Dict[str, Any], path: str, default=None):
-    """
-    Safely fetch a nested key via dotted path, e.g. _cfg_get(cfg, 'openai.llm_model')
-    """
-    cur = d
-    for part in path.split("."):
-        if not isinstance(cur, dict) or part not in cur:
-            return default
-        cur = cur[part]
-    return cur
-
-
-# ----------------------------------------------------------------------------
 # Bootstrapping
 # ----------------------------------------------------------------------------
 load_dotenv()
@@ -71,66 +37,31 @@ configure_logging()
 logger = logging.getLogger("plumber-contact-center")
 logger.setLevel(logging.INFO)
 
-CONFIG = _load_config()
+CONFIG: Dict[str, Any] = load_config()
 
-# ----------------------------------------------------------------------------
-# ENV keys (still from .env)
-# ----------------------------------------------------------------------------
+# ENV keys
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-
-def _mask_key(key: Optional[str]) -> str:
-    if not key:
-        return "<none>"
-    digest = hashlib.sha256(key.encode()).hexdigest()
-    return f"sha256:{digest[:8]}"
-
 
 if not OPENAI_API_KEY:
     logger.warning("OPENAI_API_KEY is missing. OpenAI calls will fail.")
 else:
-    logger.info("OpenAI key: %s", _mask_key(OPENAI_API_KEY))
+    logger.info("OpenAI key: %s", mask_key(OPENAI_API_KEY))
 
 if not DEEPGRAM_API_KEY:
     logger.warning("DEEPGRAM_API_KEY is missing. Deepgram realtime will fail.")
 else:
-    logger.info("Deepgram key: %s", _mask_key(DEEPGRAM_API_KEY))
+    logger.info("Deepgram key: %s", mask_key(DEEPGRAM_API_KEY))
 
 # ----------------------------------------------------------------------------
-# Config (from YAML with sensible defaults)
+# Core models & voices
 # ----------------------------------------------------------------------------
-# OpenAI models
-OPENAI_LLM_MODEL = _cfg_get(CONFIG, "openai.llm_model", "gpt-4o")
-OPENAI_TTS_MODEL_FROM_CFG = _cfg_get(CONFIG, "openai.tts_model", "gpt-4o-mini-tts")
-OPENAI_DEFAULT_VOICE = _cfg_get(CONFIG, "openai.default_voice", None)  # may be None
+OPENAI_LLM_MODEL = cfg_get(CONFIG, "openai.llm_model", "gpt-4o")
+OPENAI_TTS_MODEL = cfg_get(CONFIG, "openai.tts_model", "gpt-4o-mini-tts")
+OPENAI_DEFAULT_VOICE = cfg_get(CONFIG, "openai.default_voice", None)
 
-# Deepgram config from YAML
-DG_MODEL = _cfg_get(CONFIG, "deepgram.model", "nova-2-general")
-DG_SAMPLE_RATE = int(_cfg_get(CONFIG, "deepgram.sample_rate", 48000))
-DG_ENCODING = _cfg_get(CONFIG, "deepgram.encoding", "linear16")  # not used by plugin, kept for reference
-DG_CHANNELS = int(_cfg_get(CONFIG, "deepgram.channels", 1))      # not used by plugin, kept for reference
-DG_LANGUAGE = _cfg_get(CONFIG, "deepgram.language", "en-US")
-
-# STT behavior sub-config
-DG_STT_CFG: Dict[str, Any] = _cfg_get(CONFIG, "deepgram.stt", {}) or {}
-DG_INTERIM = bool(DG_STT_CFG.get("interim_results", True))
-DG_NO_DELAY = bool(DG_STT_CFG.get("no_delay", True))
-DG_ENDPOINTING_MS = int(DG_STT_CFG.get("endpointing_ms", 120))
-DG_PUNCTUATE = bool(DG_STT_CFG.get("punctuate", True))
-DG_SMART_FORMAT = bool(DG_STT_CFG.get("smart_format", True))
-DG_FILLER_WORDS = bool(DG_STT_CFG.get("filler_words", False))
-DG_NUMERALS = bool(DG_STT_CFG.get("numerals", False))
-
-logger.info(
-    "Deepgram config -> model=%s, sample_rate=%s, language=%s, "
-    "interim=%s, no_delay=%s, endpointing_ms=%s, punctuate=%s, smart_format=%s, filler_words=%s, numerals=%s",
-    DG_MODEL, DG_SAMPLE_RATE, DG_LANGUAGE,
-    DG_INTERIM, DG_NO_DELAY, DG_ENDPOINTING_MS, DG_PUNCTUATE, DG_SMART_FORMAT, DG_FILLER_WORDS, DG_NUMERALS,
-)
-
-# Voices per agent (provider/model/voice) from config, fallback to prior hardcoded map
-voices: Dict[str, Dict[str, str]] = _cfg_get(CONFIG, "voices", {}) or {
+# Voices per agent (configurable). You can override in config.yaml under `voices:`
+voices: Dict[str, Dict[str, str]] = cfg_get(CONFIG, "voices", {}) or {
     "router": {"provider": "openai", "model": "gpt-4o-mini-tts", "voice": "alloy"},
     "booking": {"provider": "openai", "model": "gpt-4o-mini-tts", "voice": "verse"},
     "reschedule": {"provider": "openai", "model": "gpt-4o-mini-tts", "voice": "sage"},
@@ -141,59 +72,14 @@ voices: Dict[str, Dict[str, str]] = _cfg_get(CONFIG, "voices", {}) or {
     "billing": {"provider": "openai", "model": "gpt-4o-mini-tts", "voice": "lyra"},
     "operator": {"provider": "openai", "model": "gpt-4o-mini-tts", "voice": "nala"},
 }
+# If a global OpenAI default voice is set, seed a voices["default"] for the factory fallback.
+if OPENAI_DEFAULT_VOICE and "default" not in voices:
+    voices["default"] = {"provider": "openai", "model": OPENAI_TTS_MODEL, "voice": OPENAI_DEFAULT_VOICE}
 
-# Choose a default session TTS. Prefer openai.default_voice if provided,
-# otherwise use the router agent's voice (common for entry prompts).
-_default_provider = "openai"
-router_v = voices.get("router", {})
-DEFAULT_TTS_PROVIDER = _default_provider if OPENAI_DEFAULT_VOICE else router_v.get("provider", _default_provider)
-DEFAULT_TTS_MODEL = (
-    OPENAI_TTS_MODEL_FROM_CFG if OPENAI_DEFAULT_VOICE else router_v.get("model", OPENAI_TTS_MODEL_FROM_CFG)
-)
-DEFAULT_TTS_VOICE = OPENAI_DEFAULT_VOICE or router_v.get("voice", "ash")
-
-logger.info(
-    "Default session TTS -> provider=%s, model=%s, voice=%s",
-    DEFAULT_TTS_PROVIDER,
-    DEFAULT_TTS_MODEL,
-    DEFAULT_TTS_VOICE,
-)
-
-# ----------------------------------------------------------------------------
-# Builders
-# ----------------------------------------------------------------------------
-
-def build_tts(provider: str, model: str, voice: str):
-    if provider == "openai":
-        return openai.TTS(model=model, voice=voice)
-    elif provider == "cartesia":
-        return cartesia.TTS(voice_id=voice)
-    else:
-        raise ValueError(f"Unsupported TTS provider: {provider}")
-
-
-def build_deepgram_stt() -> deepgram.STT:
-    """
-    Build Deepgram STT using kwargs from config.yaml.
-    The Python plugin accepts these directly; there is no STTOptions class.
-    """
-    kwargs = {
-        "model": DG_MODEL,
-        "language": DG_LANGUAGE,
-        "interim_results": DG_INTERIM,
-        "no_delay": DG_NO_DELAY,
-        "endpointing_ms": DG_ENDPOINTING_MS,
-        "punctuate": DG_PUNCTUATE,
-        "smart_format": DG_SMART_FORMAT,
-        "filler_words": DG_FILLER_WORDS,
-        "numerals": DG_NUMERALS,
-        "sample_rate": DG_SAMPLE_RATE,
-        "api_key": DEEPGRAM_API_KEY,
-    }
-    # Drop any None values just in case
-    kwargs = {k: v for k, v in kwargs.items() if v is not None}
-    return deepgram.STT(**kwargs)
-
+# Which agent voice powers the session TTS (defaults to router)
+SESSION_VOICE_AGENT = cfg_get(CONFIG, "session.voice_agent", "router")
+VAD_ENABLED = bool(cfg_get(CONFIG, "session.vad", True))
+MAX_TOOL_STEPS = int(cfg_get(CONFIG, "session.max_tool_steps", 6))
 
 # ----------------------------------------------------------------------------
 # Helpers: robust retry with cancel, jitter, and backoff
@@ -237,7 +123,6 @@ async def run_with_retries(
 # ----------------------------------------------------------------------------
 async def entrypoint(ctx: JobContext):
     userdata = UserData()
-
     userdata.agents.update(
         {
             "router": Router(voices=voices),
@@ -252,22 +137,25 @@ async def entrypoint(ctx: JobContext):
         }
     )
 
-    stt = build_deepgram_stt()
+    # STT & LLM
+    stt = build_deepgram_stt(CONFIG, DEEPGRAM_API_KEY)
     llm = openai.LLM(model=OPENAI_LLM_MODEL)
 
-    session_tts = build_tts(
-        provider=DEFAULT_TTS_PROVIDER,
-        model=DEFAULT_TTS_MODEL,
-        voice=DEFAULT_TTS_VOICE,
-    )
+    # TTS via voice factory (provider-agnostic)
+    session_tts = build_tts_for(SESSION_VOICE_AGENT, voices)
+    logger.info("Session TTS -> agent=%s", SESSION_VOICE_AGENT)
+
+    # Optional VAD
+    vad = silero.VAD.load() if VAD_ENABLED else None
+    logger.info("VAD enabled: %s", VAD_ENABLED)
 
     session = AgentSession[UserData](
         userdata=userdata,
         stt=stt,
         llm=llm,
         tts=session_tts,
-        vad=silero.VAD.load(),
-        max_tool_steps=6,
+        vad=vad,
+        max_tool_steps=MAX_TOOL_STEPS,
     )
 
     async def _on_error(attempt: int, err: BaseException) -> None:

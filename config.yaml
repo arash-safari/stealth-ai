@@ -3,6 +3,12 @@ openai:
   tts_model: gpt-4o-mini-tts
   default_voice: ash
 
+session:
+  voice_agent: router     # or booking/status/etc
+  vad: true               # set false to test without VAD
+  max_tool_steps: 6
+
+
 deepgram:
   model: nova-2-general
   language: en-US

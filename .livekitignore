@@ -1,0 +1,23 @@
+stealth-plumber-test/**
+
+# --- ignore big node/next caches everywhere ---
+**/node_modules/**
+**/.pnpm/**
+**/.next/**
+**/dist/**
+**/build/**
+**/.turbo/**
+**/.cache/**
+
+# --- python caches/venvs ---
+.venv
+.venv/**
+
+**/.venv/**
+**/__pycache__/**
+**/.pytest_cache/**
+
+# --- local data & misc ---
+.pgdata/**
+*.log
+.git/
