@@ -131,3 +131,6 @@ uv run python src/agent.py download-files
 task intent-console
 ```
 
+lk agent deploy
+lk agent status
+lk agent logs

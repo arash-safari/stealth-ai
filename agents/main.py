@@ -2,8 +2,8 @@
 import os
 import asyncio
 import logging
-from typing import Optional, Callable, Awaitable, Dict, Any
 from contextlib import suppress
+from typing import Optional, Callable, Awaitable, Dict, Any
 
 from dotenv import load_dotenv
 from livekit.agents import JobContext, WorkerOptions, cli
@@ -15,6 +15,10 @@ from common.voice_factory import build_tts_for
 from common.config_loader import load_config, cfg_get, mask_key
 from common.stt_factory import build_deepgram_stt
 
+for name in ("cloud.secrets.env", ".env.local", "env.local", ".env"):
+    if os.path.exists(name):
+        load_dotenv(name, override=False)
+
 from agents.router import Router
 from agents.booking import Booking
 from agents.reschedule import Reschedule
@@ -24,10 +28,14 @@ from agents.status import Status
 from agents.pricing import Pricing
 from agents.billing import Billing
 from agents.operator import Operator
-
+from db.models import init_db
+from db.session import ping as db_ping
 # Optional central logging
 from common.logging_config import configure_logging
 
+for name in ("cloud.secrets.env", ".env.local", "env.local", ".env"):
+    if os.path.exists(name):
+        load_dotenv(name, override=False)
 
 # ----------------------------------------------------------------------------
 # Bootstrapping
@@ -117,6 +125,10 @@ async def run_with_retries(
             await asyncio.sleep(sleep_for)
             delay = min(delay * 2.0, max_delay)
 
+async def _bootstrap():
+    await init_db()
+    with suppress(Exception):
+        await db_ping()
 
 # ----------------------------------------------------------------------------
 # Entrypoint
@@ -174,4 +186,5 @@ async def entrypoint(ctx: JobContext):
 
 
 if __name__ == "__main__":
+    asyncio.run(_bootstrap())
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))

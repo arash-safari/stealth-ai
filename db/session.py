@@ -1,34 +1,59 @@
+# db/session.py
+from __future__ import annotations
+
 import os
+import pathlib
+from typing import Iterable
+
+from dotenv import load_dotenv
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
-# --- Database Connection Setup for the Main Application ---
 
-# 1. Get the database URL from the environment variables.
-#    Your application should ensure .env files are loaded before this runs.
+def _load_env_files(candidates: Iterable[str]) -> None:
+    """
+    Load env files from both CWD (/app) and project root (relative to this file),
+    without overriding values already provided by the platform.
+    """
+    here = pathlib.Path(__file__).resolve()
+    roots = {
+        pathlib.Path.cwd(),                 # /app at runtime
+        here.parent.parent,                 # project root (…/app)
+    }
+    for fname in candidates:
+        for root in roots:
+            p = root / fname
+            if p.exists():
+                load_dotenv(p, override=False)
+
+
+# Load secrets if present (won't override variables already set by the platform)
+_load_env_files(("cloud.secrets.env", ".env.local", "env.local", ".env"))
+
 DATABASE_URL = os.getenv("DATABASE_URL")
+# Avoid printing secrets; just show if present (useful in `lk agent logs`)
+print("DATABASE_URL set:", DATABASE_URL)
 
-print("DATABASE_URL", DATABASE_URL)
 if not DATABASE_URL:
-    raise ValueError("DATABASE_URL environment variable is not set. The application cannot start.")
+    # Raise here so callers fail fast with a clear message
+    raise RuntimeError("DATABASE_URL is not set")
 
-# 2. Create the single, reusable SQLAlchemy engine instance for the application.
-#    The engine manages a pool of database connections.
+# Create engine/session
 engine = create_async_engine(
     DATABASE_URL,
-    pool_pre_ping=True,                  # Recommended for serverless DBs like Neon
-    echo=bool(os.getenv("SQL_ECHO")),    # Log SQL statements if SQL_ECHO is set
-    connect_args={"ssl": "require"},     # Enforce SSL connection for security
+    pool_pre_ping=True,
+    echo=bool(os.getenv("SQL_ECHO")),
+    connect_args={"ssl": "require"},  # asyncpg honors SSL; 'require' keeps Neon happy
 )
 
-# 3. Create a session factory ("Session" is a convention).
-#    This object will create new `AsyncSession` instances for each unit of work
-#    (for example, for each API request in a web application).
-Session = async_sessionmaker(
-    engine,
-    expire_on_commit=False,
-    class_=AsyncSession,
-)
+Session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
-# This setup provides a `Session` factory that your application code (like services)
-# can import to get a database session, while keeping your `db/models.py` file
-# clean and focused only on data shape.
+
+async def ping() -> bool:
+    """Optional: simple connectivity check you can call at startup."""
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        return True
+    except Exception:
+        return False

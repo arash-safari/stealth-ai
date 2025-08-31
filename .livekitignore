@@ -1,6 +1,11 @@
-stealth-plumber-test/**
+# --- ignore local venvs first (prevents packaging errors) ---
+.venv
+.venv/**
+**/.venv/**
 
-# --- ignore big node/next caches everywhere ---
+# --- common caches ---
+**/__pycache__/**
+**/.pytest_cache/**
 **/node_modules/**
 **/.pnpm/**
 **/.next/**
@@ -9,15 +14,20 @@ stealth-plumber-test/**
 **/.turbo/**
 **/.cache/**
 
-# --- python caches/venvs ---
-.venv
-.venv/**
-
-**/.venv/**
-**/__pycache__/**
-**/.pytest_cache/**
-
 # --- local data & misc ---
 .pgdata/**
 *.log
 .git/
+
+# keep these files in the bundle:
+!cloud.secrets.env
+!livekit.toml
+!pyproject.toml
+!uv.lock
+!agents/**
+!src/**
+!services/**
+!db/**
+!tools/**
+!common/**
+!config.yaml
