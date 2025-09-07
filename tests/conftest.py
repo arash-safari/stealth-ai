@@ -27,7 +27,7 @@ load_dotenv(REPO_ROOT / ".env")
 # IMPORTANT: This file assumes you have followed the advice to REMOVE the global
 # `engine` and `Session` creation from your `db/models.py` file, leaving only
 # the model definitions and the `DATABASE_URL` variable.
-from db.models import Base, DATABASE_URL
+from db.models import Base
 
 
 # --- Part 4: Test Library Imports & Pre-run Checks ---
@@ -39,6 +39,10 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+DATABASE_URL = (
+    os.getenv("DATABASE_URL_TEST")  # prefer a dedicated test URL if you have one
+    or os.getenv("DATABASE_URL")
+)
 # Optional: Fail fast if a critical API key is missing.
 if not os.getenv("OPENAI_API_KEY"):
     pytest.skip(

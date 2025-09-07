@@ -16,12 +16,12 @@ from tools.tools_schedule import (
 )
 
 class Booking(BaseAgent):
-    CATALOGUE = {
-        "FCT-001": {"name": "Kitchen faucet", "price": 120.0},
-        "FLT-002": {"name": "Toilet fill valve", "price": 35.0},
-        "WH-40": {"name": "40-gal water heater", "price": 950.0},
-        "P-PTFE": {"name": "PTFE tape", "price": 4.0},
-    }
+    # CATALOGUE = {
+    #     "FCT-001": {"name": "Kitchen faucet", "price": 120.0},
+    #     "FLT-002": {"name": "Toilet fill valve", "price": 35.0},
+    #     "WH-40": {"name": "40-gal water heater", "price": 950.0},
+    #     "P-PTFE": {"name": "PTFE tape", "price": 4.0},
+    # }
 
     def __init__(self, voices: dict | None = None) -> None:
         super().__init__(

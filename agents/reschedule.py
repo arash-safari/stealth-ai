@@ -19,28 +19,4 @@ class Reschedule(BaseAgent):
         from agents.booking import Booking
         self._booking_helper = Booking()
 
-    @function_tool()
-    async def offer_new_windows(self, context: RunContext, preferred_date: str | None = None) -> str:
-        u = context.userdata
-        if not u.appointment_id or u.appointment_status in {"canceled", None}:
-            return "No active appointment found to reschedule."
-        wins = self._booking_helper._generate_windows(preferred_date)
-        import yaml
-        return yaml.dump({"new_windows": wins[:6]}, sort_keys=False)
 
-    @function_tool()
-    async def apply_new_window(self, context: RunContext, date: str, window: str) -> str:
-        u = context.userdata
-        if not u.appointment_id:
-            return "No appointment found."
-        u.appointment_date = date
-        u.appointment_window = window
-        u.appointment_status = "scheduled"
-        return f"Rescheduled to {date} {window}"
-
-    @function_tool()
-    async def confirm_reschedule(self, context: RunContext):
-        u = context.userdata
-        if not u.appointment_id or not u.appointment_date or not u.appointment_window:
-            return "Missing appointment details."
-        return await self._transfer_to_agent("router", context)
