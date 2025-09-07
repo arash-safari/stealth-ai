@@ -20,7 +20,7 @@ for name in (".env.local", "env.local", ".env"):
         load_dotenv(name, override=False)
 
 # --- Project imports ---
-from db.session import Session  # async session factory
+from db.session import Session,engine  # async session factory
 from db.models import (
     Tech,
     Skill,
@@ -32,7 +32,7 @@ from db.models import (
     AppointmentStatus,
     RequestPriority,
     init_db,
-    engine,
+    
 )
 from services.schedule_service import (
     get_available_times,

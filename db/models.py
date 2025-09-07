@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from enum import Enum as PyEnum
 import ssl
+from sqlalchemy.pool import NullPool
 
 from sqlalchemy import (
     Text,
@@ -22,41 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy import DateTime as SADateTime
 from sqlalchemy.schema import Identity
 from sqlalchemy.engine.url import make_url, URL
-import ssl as _ssl
-
-sslmode = os.getenv("DB_SSLMODE", "disable").lower()
-ssl_arg: Any
-if sslmode in ("disable", "off", "false", "0"):
-    ssl_arg = False
-elif sslmode in ("require",):
-    ssl_arg = True  # encrypted, no verification
-elif sslmode in ("verify-ca", "verify-full"):
-    ctx = _ssl.create_default_context(cafile=os.getenv("DB_SSLROOTCERT"))
-    if sslmode == "verify-full":
-        ctx.check_hostname = True
-    ssl_arg = ctx
-else:
-    ssl_arg = False  # sane fallback
-
-DATABASE_URL = os.getenv("DATABASE_URL")  # must include sslmode=require
-    
-# (Optional) harden against bad env like PGSSLMODE="true"
-for var in ("PGSSLMODE", "PGSSLNEGOTIATION"):
-    val = os.environ.get(var)
-    if val and val.lower() not in ("disable","allow","prefer","require","verify-ca","verify-full"):
-        os.environ.pop(var, None)
-
-engine = create_async_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    echo=bool(os.getenv("SQL_ECHO")),
-    connect_args={
-        "ssl": "require"
-    }
-)
-
-
-Session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+from db.session import engine
 
 class Base(DeclarativeBase):
     pass

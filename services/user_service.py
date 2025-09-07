@@ -26,8 +26,8 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy import select, update, delete
 from sqlalchemy.exc import IntegrityError
-
-from db.models import Session, User, Address
+from db.session import Session
+from db.models import  User, Address
 
 
 # ---------- helpers ----------
