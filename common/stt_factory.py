@@ -18,13 +18,13 @@ def build_deepgram_stt(cfg: Dict[str, Any], api_key: Optional[str]) -> Optional[
     stt_cfg = (dgc.get("stt") or {})
 
     kwargs = {
-        "model": dgc.get("model", "nova-2-general"),
+        "model": dgc.get("model", "nova-3-general"),
         "language": dgc.get("language", "en-US"),
         "sample_rate": int(dgc.get("sample_rate", 16000)),  # stable default vs 48k
         # STT behavior:
         "interim_results": bool(stt_cfg.get("interim_results", True)),
-        "no_delay": bool(stt_cfg.get("no_delay", False)),
-        "endpointing_ms": int(stt_cfg.get("endpointing_ms", 250)),
+        "no_delay": bool(stt_cfg.get("no_delay", True)),
+        "endpointing_ms": int(stt_cfg.get("endpointing_ms", 120)),
         "punctuate": bool(stt_cfg.get("punctuate", True)),
         "smart_format": bool(stt_cfg.get("smart_format", True)),
         "filler_words": bool(stt_cfg.get("filler_words", False)),

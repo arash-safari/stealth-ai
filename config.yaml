@@ -10,17 +10,17 @@ session:
 
 
 deepgram:
-  model: nova-2-general
+  model: nova-3-general
   language: en-US
   sample_rate: 16000   # use 16000 if your source is telephony
   stt:
     interim_results: true
-    no_delay: true
-    endpointing_ms: 60
-    punctuate: false
-    smart_format: false
+    no_delay: false
+    endpointing_ms: 300
+    punctuate: true
+    smart_format: true
     filler_words: false
-    numerals: false
+    numerals: true
 
 
 voices:

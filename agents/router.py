@@ -19,7 +19,7 @@ class Router(BaseAgent):
                 "For your very first message, greet the caller and say: "
                 "'Welcome to Ali Plumber Company! How can I help you today?'\n"
                 "Triage the caller and route them: booking, reschedule, cancel, "
-                "parts/product requests, status/ETA, pricing/estimate, billing, or operator.\n"
+                "status/ETA, pricing/estimate, billing, or operator.\n"
                 "Ask minimal questions to decide, then use a tool to transfer."
                 "If the caller says they're done (e.g., 'no, that's all', 'thank you, bye'), "
                 "say a brief goodbye and CALL the end_call tool to hang up."
@@ -40,10 +40,6 @@ class Router(BaseAgent):
     @function_tool()
     async def to_cancel(self, context: RunContext):
         return await context.session.current_agent._transfer_to_agent("cancel", context)
-
-    @function_tool()
-    async def to_parts(self, context: RunContext):
-        return await context.session.current_agent._transfer_to_agent("parts", context)
 
     @function_tool()
     async def to_status(self, context: RunContext):

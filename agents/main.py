@@ -23,7 +23,6 @@ from agents.router import Router
 from agents.booking import Booking
 from agents.reschedule import Reschedule
 from agents.cancel import Cancel
-from agents.parts import Parts
 from agents.status import Status
 from agents.pricing import Pricing
 from agents.billing import Billing
@@ -42,6 +41,7 @@ for name in ("cloud.secrets.env", ".env.local", "env.local", ".env"):
 # ----------------------------------------------------------------------------
 load_dotenv()
 configure_logging()
+
 logger = logging.getLogger("plumber-contact-center")
 logger.setLevel(logging.INFO)
 
@@ -61,6 +61,9 @@ if not DEEPGRAM_API_KEY:
 else:
     logger.info("Deepgram key: %s", mask_key(DEEPGRAM_API_KEY))
 
+for name in ["livekit.agents", "livekit.plugins.deepgram", "aiohttp.client", "aiohttp.client_ws"]:
+    logging.getLogger(name).setLevel(logging.DEBUG)
+
 # ----------------------------------------------------------------------------
 # Core models & voices
 # ----------------------------------------------------------------------------
@@ -74,7 +77,6 @@ voices: Dict[str, Dict[str, str]] = cfg_get(CONFIG, "voices", {}) or {
     "booking": {"provider": "openai", "model": "gpt-4o-mini-tts", "voice": "verse"},
     "reschedule": {"provider": "openai", "model": "gpt-4o-mini-tts", "voice": "sage"},
     "cancel": {"provider": "openai", "model": "gpt-4o-mini-tts", "voice": "breeze"},
-    "parts": {"provider": "openai", "model": "gpt-4o-mini-tts", "voice": "opal"},
     "status": {"provider": "openai", "model": "gpt-4o-mini-tts", "voice": "pearl"},
     "pricing": {"provider": "openai", "model": "gpt-4o-mini-tts", "voice": "aria"},
     "billing": {"provider": "openai", "model": "gpt-4o-mini-tts", "voice": "lyra"},
@@ -141,7 +143,6 @@ async def entrypoint(ctx: JobContext):
             "booking": Booking(voices=voices),
             "reschedule": Reschedule(voices=voices),
             "cancel": Cancel(voices=voices),
-            "parts": Parts(voices=voices),
             "status": Status(voices=voices),
             "pricing": Pricing(voices=voices),
             "billing": Billing(voices=voices),
@@ -150,17 +151,27 @@ async def entrypoint(ctx: JobContext):
     )
 
     # STT & LLM
-    stt = build_deepgram_stt(CONFIG, DEEPGRAM_API_KEY)
+    # stt = build_deepgram_stt(CONFIG, DEEPGRAM_API_KEY)
+    stt = openai.STT(model="gpt-4o-transcribe", language="en")
+
     llm = openai.LLM(model=OPENAI_LLM_MODEL)
 
     # TTS via voice factory (provider-agnostic)
     session_tts = build_tts_for(SESSION_VOICE_AGENT, voices)
     logger.info("Session TTS -> agent=%s", SESSION_VOICE_AGENT)
 
-    # Optional VAD
-    vad = silero.VAD.load() if VAD_ENABLED else None
-    logger.info("VAD enabled: %s", VAD_ENABLED)
+    # Optional VAD (a bit more permissive so quiet mics still trigger)
+    if VAD_ENABLED:
+        try:
+            vad = silero.VAD.load(activation_threshold=0.35, min_silence_duration=0.25)
+        except Exception as e:
+            logger.warning("VAD load failed, continuing without VAD: %s", e)
+            vad = None
+    else:
+        vad = None
+    logger.info("VAD enabled: %s", bool(vad))
 
+    # --- Keep user audio during agent turns; make interruptions responsive ---
     session = AgentSession[UserData](
         userdata=userdata,
         stt=stt,
@@ -168,7 +179,49 @@ async def entrypoint(ctx: JobContext):
         tts=session_tts,
         vad=vad,
         max_tool_steps=MAX_TOOL_STEPS,
+        allow_interruptions=True,                 # let the user barge in
+        discard_audio_if_uninterruptible=False,   # buffer mic audio instead of dropping it
+        min_interruption_duration=0.2,            # responsive interruptions
+        min_interruption_words=0,
+        min_endpointing_delay=0.2,                # end user turn a bit quicker
+        max_endpointing_delay=6.0,                # cap very long rambles
     )
+
+    # ---- Diagnostics: log agent state & user transcripts; silence watchdog ----
+    last_heard_ts: float = 0.0
+    try:
+        @session.on("agent_state_changed")
+        def _on_state(evt):
+            logger.debug("agent_state=%s", getattr(evt, "state", evt))
+
+        @session.on("user_input_transcribed")
+        def _on_user(evt):
+            nonlocal last_heard_ts
+            last_heard_ts = asyncio.get_running_loop().time()
+            logger.debug(
+                "USER[%s]: %s",
+                "final" if getattr(evt, "is_final", False) else "partial",
+                getattr(evt, "transcript", ""),
+            )
+    except Exception:
+        # Older SDKs may not expose these events; ignore if unavailable.
+        pass
+
+    async def _silence_watchdog(timeout_s: float = 12.0, interval: float = 1.0):
+        """Warn once if no transcripts arrive for a while (helps spot gating/device issues)."""
+        start = asyncio.get_running_loop().time()
+        warned = False
+        while not warned:
+            await asyncio.sleep(interval)
+            now = asyncio.get_running_loop().time()
+            if last_heard_ts == 0.0 and (now - start) > timeout_s:
+                logger.warning(
+                    "No user transcripts for %.0fs. If the console meter moves but nothing transcribes, "
+                    "audio is likely gated by turn-taking; if the meter is flat (~-70 dBFS), select the correct "
+                    "mic in the 'Recording' tab of pavucontrol.",
+                    timeout_s,
+                )
+                warned = True
 
     async def _on_error(attempt: int, err: BaseException) -> None:
         msg = str(err)
@@ -181,9 +234,16 @@ async def entrypoint(ctx: JobContext):
 
     async def _start_session() -> None:
         await session.start(agent=userdata.agents["router"], room=ctx.room)
+        # belt & suspenders: make sure mic is accepting audio
+        try:
+            session.input.set_audio_enabled(True)
+            logger.debug("mic explicitly enabled after session.start()")
+        except Exception:
+            pass
+        # arm the silence watchdog (non-fatal; just logs once if nothing is heard)
+        asyncio.create_task(_silence_watchdog())
 
     await run_with_retries(_start_session, on_error=_on_error)
-
 
 if __name__ == "__main__":
     asyncio.run(_bootstrap())

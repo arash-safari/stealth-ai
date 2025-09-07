@@ -130,7 +130,9 @@ Then skip Compose and just run the console:
 uv run python src/agent.py download-files
 task intent-console
 ```
+if you want to push the demo on live put DB_SSLMODE=required on .env.local and run these commands:
 
 lk agent deploy
 lk agent status
 lk agent logs
+
