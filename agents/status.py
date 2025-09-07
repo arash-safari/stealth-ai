@@ -1,4 +1,4 @@
-##  agents/status.py
+# agents/status.py
 import yaml
 from datetime import datetime, timezone
 from livekit.plugins import openai
@@ -7,6 +7,7 @@ from livekit.agents.voice import RunContext
 
 from common.base_agent import BaseAgent
 from tools.tools_schedule import read_meeting
+from common.utils import _dt_utc  # <-- add this import
 
 class Status(BaseAgent):
     def __init__(self, voices: dict | None = None) -> None:
@@ -24,7 +25,7 @@ class Status(BaseAgent):
         """Check status by public appointment number (preferred) or UUID string."""
         # Fetch fresh data from the schedule service (no reliance on context.userdata)
         try:
-            yaml_str = await read_meeting(context,appointment_no =ref)
+            yaml_str = await read_meeting(context, appointment_no=ref)
         except Exception:
             return "Appointment not found."
 
@@ -36,23 +37,22 @@ class Status(BaseAgent):
         appt_id = data.get("id")
         appt_no = data.get("appointment_no")
         status = str(data.get("status") or "").lower()
-        start_s = data.get("start")
-        end_s = data.get("end")
+        start_raw = data.get("start")
+        end_raw = data.get("end")
         label = f"#{appt_no}" if appt_no is not None else (appt_id or "(unknown)")
 
-        # Parse window
+        # Parse window robustly (strings with 'Z', or datetime objects)
         try:
-            sdt = datetime.fromisoformat(start_s)
-            edt = datetime.fromisoformat(end_s)
+            sdt_utc = _dt_utc(start_raw)
+            edt_utc = _dt_utc(end_raw)
+            if not sdt_utc or not edt_utc:
+                raise ValueError("missing time")
         except Exception:
             return f"Appointment {label}: time info unavailable."
 
-        # Use UTC to match service outputs consistently
-        sdt_utc = sdt.astimezone(timezone.utc)
-        edt_utc = edt.astimezone(timezone.utc)
         appt_date = sdt_utc.date().isoformat()
         window = f"{sdt_utc.strftime('%H:%M')}-{edt_utc.strftime('%H:%M')}"
-        today = datetime.utcnow().date().isoformat()
+        today = datetime.now(timezone.utc).date().isoformat()
 
         if "canceled" in status:
             return f"Appointment {label} is canceled."
