@@ -348,3 +348,73 @@ async def create_earliest_meeting(
     res["start"] = res["start"].isoformat()
     res["end"] = res["end"].isoformat()
     return yaml.dump(res, sort_keys=False)
+
+# agents/reschedule.py (replace just the confirm_reschedule method)
+
+
+@function_tool()
+async def confirm_reschedule(
+    self,
+    context: RunContext,
+    start: str,
+    end: str,
+    appointment_no: str | None = None,
+    request_text: str | None = None,
+) -> str:
+    """
+    Finalize the reschedule and TELL the user the new appointment number and window.
+    Robust to tool outputs where start/end are str or datetime, and to 'Z' suffix.
+    """
+    u = context.userdata
+    appt = appointment_no or getattr(u, "appointment_id", None)
+    if not appt:
+        return "No appointment number on file. Please provide your appointment number."
+
+    # Call the tool and parse YAML/dict
+    tool = getattr(tool_confirm_reschedule, "__wrapped__", tool_confirm_reschedule)
+    res = await tool(context, appointment_no=str(appt), start=start, end=end, request_text=request_text)
+    payload = yaml.safe_load(res) if isinstance(res, str) else (res or {})
+
+    new_no = payload.get("appointment_no") or str(appt)
+    appt_obj = payload.get("appointment", {}) or {}
+
+    s_raw = appt_obj.get("start") or start
+    e_raw = appt_obj.get("end") or end
+
+    # --- Normalize to ISO-8601 strings Python can parse ---
+    def _to_parseable_iso(x) -> str:
+        if isinstance(x, datetime):
+            s = x.isoformat()
+        else:
+            s = str(x)
+        # Python's datetime.fromisoformat doesn't accept 'Z' -> convert
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return s
+
+    s_iso = _to_parseable_iso(s_raw)
+    e_iso = _to_parseable_iso(e_raw)
+
+    # --- Update userdata (with robust fallbacks) ---
+    try:
+        s_dt = _dt_utc(s_iso)
+        e_dt = _dt_utc(e_iso)
+        u.appointment_date = s_dt.date().isoformat()
+        u.appointment_window = f"{s_dt.strftime('%H:%M')}-{e_dt.strftime('%H:%M')}"
+    except Exception:
+        # Fallbacks if parsing still fails
+        if isinstance(s_raw, datetime) and isinstance(e_raw, datetime):
+            u.appointment_date = s_raw.date().isoformat()
+            u.appointment_window = f"{s_raw.strftime('%H:%M')}-{e_raw.strftime('%H:%M')}"
+        else:
+            u.appointment_date = (s_iso or "")[:10] or getattr(u, "appointment_date", None)
+            try:
+                u.appointment_window = f"{s_iso[11:16]}-{e_iso[11:16]}"
+            except Exception:
+                pass
+
+    u.appointment_status = "rescheduled"
+    u.appointment_id = new_no
+
+    # Speak the new number + window (≤2 sentences)
+    return f"Done. Your new appointment number is {new_no}. Window: {u.appointment_date} {u.appointment_window}."

@@ -3,31 +3,84 @@
 import logging
 from datetime import datetime, timedelta, time, timezone
 from zoneinfo import ZoneInfo
-from typing import Optional, Dict
+from typing import Optional, Dict, Union
 
 from db.models import AppointmentStatus, RequestPriority
 
 logger = logging.getLogger("plumber-contact-center")
 
 
-def _dt_utc(s: Optional[str]) -> Optional[datetime]:
-    if not s:
+def _dt_utc(s: Optional[Union[str, datetime]]) -> Optional[datetime]:
+    """
+    Parse s into a timezone-aware UTC datetime.
+    Accepts:
+      - datetime (naive or tz-aware)
+      - ISO strings (with or without 'Z')
+      - 'YYYY-MM-DD HH:MM' / 'YYYY-MM-DDTHH:MM' / 'YYYY-MM-DD HH:MM:SS'
+    """
+    if s is None or s == "":
         return None
-    # ISO 8601 first
-    try:
-        dt = datetime.fromisoformat(s)
-    except Exception:
-        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
-            try:
-                dt = datetime.strptime(s, fmt)
-                break
-            except Exception:
-                continue
-        else:
-            raise ValueError(f"Unparseable datetime: {s}")
+
+    # If already a datetime, normalize to UTC
+    if isinstance(s, datetime):
+        dt = s
+    else:
+        s2 = str(s).strip()
+        # Normalize trailing 'Z' to +00:00 for fromisoformat
+        if s2.endswith("Z"):
+            s2 = s2[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s2)
+        except ValueError:
+            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    dt = datetime.strptime(s2, fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                raise ValueError(f"Unparseable datetime: {s!r}")
+
+    # If naive, assume UTC; otherwise convert to UTC
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+# def _dt_utc(s: Optional[Union[str, datetime]]) -> Optional[datetime]:
+#     """
+#     Parse s into a timezone-aware UTC datetime.
+#     Accepts:
+#       - datetime (naive or tz-aware)
+#       - ISO strings (with or without 'Z')
+#       - 'YYYY-MM-DD HH:MM' / 'YYYY-MM-DDTHH:MM' / 'YYYY-MM-DD HH:MM:SS'
+#     """
+#     if s is None or s == "":
+#         return None
+
+#     # If already a datetime, normalize to UTC
+#     if isinstance(s, datetime):
+#         dt = s
+#     else:
+#         s2 = str(s).strip()
+#         # Normalize trailing 'Z' to +00:00 for fromisoformat
+#         if s2.endswith("Z"):
+#             s2 = s2[:-1] + "+00:00"
+#         try:
+#             dt = datetime.fromisoformat(s2)
+#         except ValueError:
+#             for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S"):
+#                 try:
+#                     dt = datetime.strptime(s2, fmt)
+#                     break
+#                 except ValueError:
+#                     continue
+#             else:
+#                 raise ValueError(f"Unparseable datetime: {s!r}")
+
+#     # If naive, assume UTC; otherwise convert to UTC
+#     if dt.tzinfo is None:
+#         dt = dt.replace(tzinfo=timezone.utc)
+#     return dt.astimezone(timezone.utc)
 
 
 def _time_of(daytime: str) -> time:

@@ -616,3 +616,4 @@ async def read_meeting_by_appointment_number(appointment_no: int):
             "google_event_id": appt.google_event_id,
             "hangout_link": appt.hangout_link,
         }
+
