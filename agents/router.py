@@ -57,16 +57,16 @@ class Router(BaseAgent):
     async def to_operator(self, context: RunContext):
         return await context.session.current_agent._transfer_to_agent("operator", context)
 
-    @function_tool()
-    async def end_call(self, context: RunContext) -> str:
-        handle = await context.session.say(
-            "Thanks for calling Ali Plumber Company. Goodbye!",
-            allow_interruptions=False,
-        )
-        if handle:
-            await handle.wait_for_playout()
-        scrub_user_data(context.userdata)
-        await scrub_all_histories(context)
-        result = await hangup_call()
-        logger.info("end_call(): hangup result=%s; userdata & histories scrubbed", result)
-        return f"Call ended ({result})."
+    # @function_tool()
+    # async def end_call(self, context: RunContext) -> str:
+    #     handle = await context.session.say(
+    #         "Thanks for calling Ali Plumber Company. Goodbye!",
+    #         allow_interruptions=False,
+    #     )
+    #     if handle:
+    #         await handle.wait_for_playout()
+    #     scrub_user_data(context.userdata)
+    #     await scrub_all_histories(context)
+    #     result = await hangup_call()
+    #     logger.info("end_call(): hangup result=%s; userdata & histories scrubbed", result)
+    #     return f"Call ended ({result})."
