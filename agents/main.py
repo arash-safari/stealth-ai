@@ -4,21 +4,17 @@ import asyncio
 import logging
 from contextlib import suppress
 from typing import Optional, Callable, Awaitable, Dict, Any
-
 from dotenv import load_dotenv
 from livekit.agents import JobContext, WorkerOptions, cli
 from livekit.agents.voice import AgentSession
 from livekit.plugins import openai, silero
-
 from common.models import UserData
 from common.voice_factory import build_tts_for
 from common.config_loader import load_config, cfg_get, mask_key
 from common.stt_factory import build_deepgram_stt
-
 for name in ("cloud.secrets.env", ".env.local", "env.local", ".env"):
     if os.path.exists(name):
         load_dotenv(name, override=False)
-
 from agents.router import Router
 from agents.booking import Booking
 from agents.reschedule import Reschedule
@@ -31,7 +27,9 @@ from db.models import init_db
 from db.session import ping as db_ping
 # Optional central logging
 from common.logging_config import configure_logging
-
+from common.call_recorder import CallRecorder
+from db.session import Session
+from db.models import Call, utcnow
 for name in ("cloud.secrets.env", ".env.local", "env.local", ".env"):
     if os.path.exists(name):
         load_dotenv(name, override=False)
@@ -132,11 +130,27 @@ async def _bootstrap():
     with suppress(Exception):
         await db_ping()
 
+
 # ----------------------------------------------------------------------------
 # Entrypoint
 # ----------------------------------------------------------------------------
+
 async def entrypoint(ctx: JobContext):
+    # 1) Build per-call state and write Call row
     userdata = UserData()
+    async with Session() as db:
+        call = Call(
+            # Fill what you know at dial-in; you can update phone later from userdata
+            phone=None,
+            channel="voice",
+        )
+        db.add(call)
+        await db.commit()
+        await db.refresh(call)
+        call_id = str(call.id)
+    userdata.call_id = call_id
+
+    # 2) Seed agent registry
     userdata.agents.update(
         {
             "router": Router(voices=voices),
@@ -150,17 +164,14 @@ async def entrypoint(ctx: JobContext):
         }
     )
 
-    # STT & LLM
+    # 3) STT/LLM/TTS pipeline
     # stt = build_deepgram_stt(CONFIG, DEEPGRAM_API_KEY)
     stt = openai.STT(model="gpt-4o-transcribe", language="en")
-
     llm = openai.LLM(model=OPENAI_LLM_MODEL)
-
-    # TTS via voice factory (provider-agnostic)
     session_tts = build_tts_for(SESSION_VOICE_AGENT, voices)
     logger.info("Session TTS -> agent=%s", SESSION_VOICE_AGENT)
 
-    # Optional VAD (a bit more permissive so quiet mics still trigger)
+    # 4) Optional VAD
     if VAD_ENABLED:
         try:
             vad = silero.VAD.load(activation_threshold=0.35, min_silence_duration=0.25)
@@ -171,7 +182,7 @@ async def entrypoint(ctx: JobContext):
         vad = None
     logger.info("VAD enabled: %s", bool(vad))
 
-    # --- Keep user audio during agent turns; make interruptions responsive ---
+    # 5) Create the session (responsive interruption settings kept)
     session = AgentSession[UserData](
         userdata=userdata,
         stt=stt,
@@ -179,15 +190,18 @@ async def entrypoint(ctx: JobContext):
         tts=session_tts,
         vad=vad,
         max_tool_steps=MAX_TOOL_STEPS,
-        allow_interruptions=True,                 # let the user barge in
-        discard_audio_if_uninterruptible=False,   # buffer mic audio instead of dropping it
-        min_interruption_duration=0.2,            # responsive interruptions
+        allow_interruptions=True,
+        discard_audio_if_uninterruptible=False,
+        min_interruption_duration=0.2,
         min_interruption_words=0,
-        min_endpointing_delay=0.2,                # end user turn a bit quicker
-        max_endpointing_delay=6.0,                # cap very long rambles
+        min_endpointing_delay=0.2,
+        max_endpointing_delay=6.0,
     )
 
-    # ---- Diagnostics: log agent state & user transcripts; silence watchdog ----
+    # 6) Attach CallRecorder BEFORE start so it can hook events
+    recorder = await CallRecorder.enable(session, call_id=call_id)
+
+    # 7) Diagnostics and “silence watchdog”
     last_heard_ts: float = 0.0
     try:
         @session.on("agent_state_changed")
@@ -204,11 +218,9 @@ async def entrypoint(ctx: JobContext):
                 getattr(evt, "transcript", ""),
             )
     except Exception:
-        # Older SDKs may not expose these events; ignore if unavailable.
         pass
 
     async def _silence_watchdog(timeout_s: float = 12.0, interval: float = 1.0):
-        """Warn once if no transcripts arrive for a while (helps spot gating/device issues)."""
         start = asyncio.get_running_loop().time()
         warned = False
         while not warned:
@@ -223,6 +235,28 @@ async def entrypoint(ctx: JobContext):
                 )
                 warned = True
 
+    # 8) Best-effort finalization on disconnect/teardown (extra safety besides end_call tool)
+    try:
+        @session.on("disconnected")
+        async def _on_disc(_evt):
+            try:
+                await recorder.shutdown()  # idempotent
+            except Exception:
+                logger.exception("CallRecorder shutdown on disconnect failed")
+            # mark Call.ended_at if not set
+            try:
+                async with Session() as db:
+                    c = await db.get(Call, uuid.UUID(call_id))
+                    if c and not c.ended_at:
+                        c.ended_at = utcnow()
+                        await db.commit()
+            except Exception:
+                logger.debug("Could not set ended_at on disconnect", exc_info=True)
+    except Exception:
+        # Older SDKs may not expose; non-fatal
+        pass
+
+    # 9) Start the session with retry & arm watchdog
     async def _on_error(attempt: int, err: BaseException) -> None:
         msg = str(err)
         if "Connection reset by peer" in msg or "1011" in msg:
@@ -234,13 +268,11 @@ async def entrypoint(ctx: JobContext):
 
     async def _start_session() -> None:
         await session.start(agent=userdata.agents["router"], room=ctx.room)
-        # belt & suspenders: make sure mic is accepting audio
         try:
             session.input.set_audio_enabled(True)
             logger.debug("mic explicitly enabled after session.start()")
         except Exception:
             pass
-        # arm the silence watchdog (non-fatal; just logs once if nothing is heard)
         asyncio.create_task(_silence_watchdog())
 
     await run_with_retries(_start_session, on_error=_on_error)

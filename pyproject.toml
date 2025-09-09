@@ -33,6 +33,10 @@ dependencies = [
   "SQLAlchemy[asyncio]>=2.0",
   "asyncpg>=0.29",
   "pydantic[email]>=2",
+
+  "boto3>=1.28,<2",
+  "PyYAML>=6.0",
+  
 ]
 
 [dependency-groups]
@@ -40,6 +44,9 @@ dev = [
   "pytest",
   "pytest-asyncio",
   "ruff",
+  "boto3-stubs[s3]>=1.28,<2",
+  "types-PyYAML",
+  "moto[s3]>=5"
 ]
 
 [tool.setuptools.packages.find]

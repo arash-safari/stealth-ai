@@ -56,12 +56,14 @@ else:
     ssl_arg = False  # sane fallback
 
 DATABASE_URL = os.getenv("DATABASE_URL")  # must include sslmode=require
-    
+print("DATABASE_URL set:", DATABASE_URL)
+
 # (Optional) harden against bad env like PGSSLMODE="true"
 for var in ("PGSSLMODE", "PGSSLNEGOTIATION"):
     val = os.environ.get(var)
     if val and val.lower() not in ("disable","allow","prefer","require","verify-ca","verify-full"):
         os.environ.pop(var, None)
+ssl_ctx = _ssl.create_default_context()   # encrypted
 
 engine = create_async_engine(
     DATABASE_URL,
@@ -69,7 +71,7 @@ engine = create_async_engine(
     poolclass=NullPool,
     echo=bool(os.getenv("SQL_ECHO")),
     connect_args={
-        "ssl": "require"
+        "ssl": "require",
     }
 )
 

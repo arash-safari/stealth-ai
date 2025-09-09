@@ -24,12 +24,7 @@ from sqlalchemy import DateTime as SADateTime
 from sqlalchemy.schema import Identity
 from sqlalchemy.engine.url import make_url, URL
 from db.session import engine
-
-class Base(DeclarativeBase):
-    pass
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+from db.utils import Base, utcnow
 
 # ---------- Enums ----------
 class AppointmentStatus(str, PyEnum):
@@ -172,6 +167,7 @@ Index("ix_appointments_tech_range", Appointment.tech_id, Appointment.start_ts, A
 Index("ix_holds_tech_range", Hold.tech_id, Hold.start_ts, Hold.end_ts)
 
 async def init_db() -> None:
+    import db.models_artifacts
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
